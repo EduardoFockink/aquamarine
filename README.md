@@ -1,11 +1,40 @@
-# aquamarine + AQ_MGPU_CPU_COPY
+# Hyprland on the NVIDIA GPU with the monitor on the Intel iGPU (aquamarine AQ_MGPU_CPU_COPY)
 
 A small patch set for [aquamarine](https://github.com/hyprwm/aquamarine) (the rendering backend of
-Hyprland) that makes **"NVIDIA renders, Intel scans out"** work on hybrid laptops where the external
-display is wired to the Intel iGPU, plus the Arch Linux packaging and the standalone tests behind it.
+Hyprland) that makes **"NVIDIA renders, Intel scans out"** work on hybrid (Optimus) laptops where the
+external display is wired to the Intel iGPU, plus the Arch Linux packaging and the standalone tests behind it.
 
 This is a personal fork, not an upstream feature. This `packaging` branch holds the PKGBUILD, the patches
 exported from the code branches, a pacman hook, and tests; the code lives in the branches listed below.
+
+## Symptoms this fixes
+
+You have a hybrid laptop (Intel iGPU + NVIDIA dGPU on the proprietary driver), the external monitor is
+connected to a port wired to the Intel GPU (USB-C / Thunderbolt / DisplayPort alt mode is typical), and you
+set `AQ_DRM_DEVICES` so the NVIDIA card comes first and does the rendering. Then:
+
+- **login loop**: Hyprland starts, the screen stays black, and you are back at the display manager (SDDM, GDM...);
+- `~/.cache/hyprland/hyprlandCrashReport*.txt` shows `Hyprland received signal 6(ABRT)` with this stack:
+
+  ```
+  dri_create_fence_fd
+  Aquamarine::CDRMRenderer::recreateBlitSync()
+  Aquamarine::CDRMRenderer::blit(...)
+  Aquamarine::CDRMOutput::commitState(bool)
+  Aquamarine::CDRMOutput::commit()
+  ```
+
+- `AQ_MGPU_NO_EXPLICIT=1` does not help (the fence is still created), and `AQ_FORCE_LINEAR_BLIT` cannot help
+  either: the NVIDIA driver lists `LINEAR` only as `external_only`, so it cannot render to it.
+
+Related upstream reports with the same root cause on other GPU pairs:
+[#408](https://github.com/hyprwm/aquamarine/issues/408) (NVIDIA + AMD, every frame through a CPU readback) and
+[#220](https://github.com/hyprwm/aquamarine/issues/220) (secondary AMD output, "destination dmabuf unsupported").
+KWin handles this setup with a CPU import (`chose cpu import with format AR24 and modifier 0x300000000cdb014`
+in its debug log); this patch set gives aquamarine the same last-resort path.
+
+Keywords: Hyprland NVIDIA Intel external monitor black screen, reverse PRIME, multi-GPU, hybrid graphics,
+Optimus, aquamarine multigpu blit, BLOCK_LINEAR, dumb buffer, Wayland, Arch Linux.
 
 ## The problem
 
