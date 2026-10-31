@@ -111,6 +111,13 @@ namespace Aquamarine {
 
         SBlitResult blit(Hyprutils::Memory::CSharedPointer<IBuffer> from, Hyprutils::Memory::CSharedPointer<IBuffer> to,
                          Hyprutils::Memory::CSharedPointer<CDRMRenderer> primaryRenderer, int waitFD = -1);
+
+        // Reads only `region` of `from` (a buffer this renderer can import) straight into CPU memory at `dst`,
+        // laid out like `from` with `dstStride` bytes per row. glFormat is GL_BGRA_EXT for [AX]RGB8888 and
+        // GL_RGBA for [AX]BGR8888. Synchronous: when it returns, the pixels are in `dst`.
+        // Used by AQ_MGPU_CPU_COPY so the secondary GPU never reads (or renders from) the primary's buffers.
+        bool readRegionInto(Hyprutils::Memory::CSharedPointer<IBuffer> from, uint8_t* dst, uint32_t dstStride, GLenum glFormat, const Hyprutils::Math::CRegion& region,
+                            int waitFD = -1);
         // can't be a SP<> because we call it from buf's ctor...
         void clearBuffer(IBuffer* buf);
 
@@ -171,6 +178,7 @@ namespace Aquamarine {
         CDRMRenderer() = default;
 
         EGLImageKHR                                           createEGLImage(const SDMABUFAttrs& attrs);
+        GLuint                                                readFramebuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf);
         bool                                                  verifyDestinationDMABUF(const SDMABUFAttrs& attrs);
         void                                                  waitOnSync(int fd);
         int                                                   recreateBlitSync();
