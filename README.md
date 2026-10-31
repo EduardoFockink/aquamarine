@@ -78,10 +78,11 @@ frame. Reading into a PBO first was measured and is slower (6.9 vs 4.3 ms per fu
 | `main` | Mirror of upstream `main`. |
 | `mgpu-cpu-copy-0.15.1` | The three commits on top of upstream `v0.15.1`. |
 | `v0.15.1-mgpu-1.3` | The exact code in package `0.15.1-1.3`. |
+| `mgpu-cpu-copy-main` | The same three commits on top of upstream `main` (after #279). Daily-driven since 2026-10-31 as a `0.15.1.r13` build; the base for the next release. |
 | `packaging` | This branch. |
 
-Planned: `mgpu-cpu-copy-main`, the same feature rebuilt on top of upstream `main`, reusing the CPU-copy
-fallback that [#279](https://github.com/hyprwm/aquamarine/pull/279) added for evdi.
+Next step for `mgpu-cpu-copy-main`: reuse the dumb allocator and the CPU-copy fallback that
+[#279](https://github.com/hyprwm/aquamarine/pull/279) added for evdi, to make the diff smaller and upstreamable.
 
 ## Build and install (Arch Linux)
 
