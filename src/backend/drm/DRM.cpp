@@ -2685,13 +2685,27 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
                 return false;
             }
 
+            // the dumb buffer gets the same layout as the primary's buffer, except that 10 bit always goes opaque:
+            // planes often scan out [XA]RGB8888 and X*2101010 but not A*2101010 (Intel gen9 doesn't)
+            using eLayout       = CDRMRenderer::eCpuCopyLayout;
             const auto DMA      = STATE.buffer->dmabuf();
-            GLenum     glFormat = 0;
+            eLayout    layout   = eLayout::BGRA8;
+            uint32_t   dumbFmt  = DMA.format;
             switch (DMA.format) {
                 case DRM_FORMAT_XRGB8888:
-                case DRM_FORMAT_ARGB8888: glFormat = GL_BGRA_EXT; break;
+                case DRM_FORMAT_ARGB8888: layout = eLayout::BGRA8; break;
                 case DRM_FORMAT_XBGR8888:
-                case DRM_FORMAT_ABGR8888: glFormat = GL_RGBA; break;
+                case DRM_FORMAT_ABGR8888: layout = eLayout::RGBA8; break;
+                case DRM_FORMAT_XBGR2101010:
+                case DRM_FORMAT_ABGR2101010:
+                    layout  = eLayout::XBGR2101010;
+                    dumbFmt = DRM_FORMAT_XBGR2101010;
+                    break;
+                case DRM_FORMAT_XRGB2101010:
+                case DRM_FORMAT_ARGB2101010:
+                    layout  = eLayout::XRGB2101010;
+                    dumbFmt = DRM_FORMAT_XRGB2101010;
+                    break;
                 default:
                     backend->backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MGPU_CPU_COPY: unsupported format {}", fourccToName(DMA.format)));
                     return false;
@@ -2709,7 +2723,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
 
             auto OPTIONS   = copy.swapchain->currentOptions();
             OPTIONS.size   = STATE.buffer->size;
-            OPTIONS.format = DMA.format;
+            OPTIONS.format = dumbFmt;
             OPTIONS.length = 2;
             OPTIONS.cursor = false;
             if (const auto& CUR = copy.swapchain->currentOptions(); CUR.size != OPTIONS.size || CUR.format != OPTIONS.format || CUR.length != OPTIONS.length) {
@@ -2745,7 +2759,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
             const auto [PTR, FMT, LEN] = BUF->beginDataPtr(0);
             const auto STRIDE          = BUF->dmabuf().strides.at(0);
             const bool COPIED          = PTR &&
-                PRIMARY_RENDERER->readRegionInto(STATE.buffer, PTR, STRIDE, glFormat, toCopy,
+                PRIMARY_RENDERER->readRegionInto(STATE.buffer, PTR, STRIDE, layout, toCopy,
                                                  (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
             BUF->endDataPtr();
             if (!COPIED) {

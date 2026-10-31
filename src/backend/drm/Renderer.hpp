@@ -104,11 +104,18 @@ namespace Aquamarine {
         SBlitResult blit(Hyprutils::Memory::CSharedPointer<IBuffer> from, Hyprutils::Memory::CSharedPointer<IBuffer> to,
                          Hyprutils::Memory::CSharedPointer<CDRMRenderer> primaryRenderer, int waitFD = -1);
 
+        // Memory layout readRegionInto writes, 4 bytes per pixel. Pick the one matching `from`'s format.
+        enum class eCpuCopyLayout : uint8_t {
+            BGRA8,       // [AX]RGB8888
+            RGBA8,       // [AX]BGR8888
+            XBGR2101010, // [AX]BGR2101010 (alpha bits set)
+            XRGB2101010, // [AX]RGB2101010 (alpha bits set)
+        };
+
         // Reads only `region` of `from` (a buffer this renderer can import) straight into CPU memory at `dst`,
-        // laid out like `from` with `dstStride` bytes per row. glFormat is GL_BGRA_EXT for [AX]RGB8888 and
-        // GL_RGBA for [AX]BGR8888. Synchronous: when it returns, the pixels are in `dst`.
+        // laid out as `layout` with `dstStride` bytes per row. Synchronous: when it returns, the pixels are in `dst`.
         // Used by AQ_MGPU_CPU_COPY so the secondary GPU never reads (or renders from) the primary's buffers.
-        bool readRegionInto(Hyprutils::Memory::CSharedPointer<IBuffer> from, uint8_t* dst, uint32_t dstStride, GLenum glFormat, const Hyprutils::Math::CRegion& region,
+        bool readRegionInto(Hyprutils::Memory::CSharedPointer<IBuffer> from, uint8_t* dst, uint32_t dstStride, eCpuCopyLayout layout, const Hyprutils::Math::CRegion& region,
                             int waitFD = -1);
         // can't be a SP<> because we call it from buf's ctor...
         void clearBuffer(IBuffer* buf);
@@ -171,6 +178,17 @@ namespace Aquamarine {
 
         EGLImageKHR                                           createEGLImage(const SDMABUFAttrs& attrs);
         GLuint                                                readFramebuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf);
+        GLuint                                                packFramebuffer(Hyprutils::Memory::CSharedPointer<IBuffer> from, const Hyprutils::Math::CRegion& region, bool swapRB);
+
+        // readRegionInto for 10 bit: the driver can't read 2101010 into CPU memory quickly (NVIDIA converts in
+        // software, ~330 ms for 5120x2160), so a shader first repacks each pixel's 32-bit word into an RGBA8
+        // renderbuffer, which reads back on the fast 8 bit path. Created on first use.
+        struct {
+            GLuint                    program[2] = {0, 0}; // GL_TEXTURE_2D, GL_TEXTURE_EXTERNAL_OES
+            GLint                     tex[2] = {-1, -1}, invSize[2] = {-1, -1}, swapRB[2] = {-1, -1};
+            GLuint                    vao = 0, fbo = 0, rbo = 0;
+            Hyprutils::Math::Vector2D size;
+        } cpuCopyPack;
         bool                                                  verifyDestinationDMABUF(const SDMABUFAttrs& attrs);
         void                                                  waitOnSync(int fd);
         int                                                   recreateBlitSync();
