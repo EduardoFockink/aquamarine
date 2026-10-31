@@ -777,20 +777,19 @@ CGLTex CDRMRenderer::glTex(Hyprutils::Memory::CSharedPointer<IBuffer> buffa) {
 
 constexpr GLenum PIXEL_BUFFER_FORMAT = GL_RGBA;
 
-void             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out) {
-    CEglContextGuard eglContext(*this);
-    auto             att = buf->attachments.get<CDRMRendererBufferOutputAttachment>();
+// Returns an FBO (cached in buf's output attachment) to read buf from, or 0 on failure. Needs a current context.
+GLuint CDRMRenderer::readFramebuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf) {
+    auto att = buf->attachments.get<CDRMRendererBufferOutputAttachment>();
     if (!att || att->renderer != self) {
         att = makeShared<CDRMRendererBufferOutputAttachment>(self, nullptr, 0, 0);
         buf->attachments.add(att);
     }
 
-    const auto& dma = buf->dmabuf();
     if (!att->eglImage) {
-        att->eglImage = createEGLImage(dma);
+        att->eglImage = createEGLImage(buf->dmabuf());
         if (att->eglImage == EGL_NO_IMAGE_KHR) {
             backend->log(AQ_LOG_ERROR, std::format("EGL (readBuffer): createEGLImage failed: {}", eglGetError()));
-            return;
+            return 0;
         }
 
         GLCALL(glGenRenderbuffers(1, &att->rbo));
@@ -804,14 +803,65 @@ void             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuf
 
         if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
             backend->log(AQ_LOG_ERROR, std::format("EGL (readBuffer): glCheckFramebufferStatus failed: {}", glGetError()));
-            return;
+            return 0;
         }
     }
 
-    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, att->fbo));
+    return att->fbo;
+}
+
+void CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out) {
+    CEglContextGuard eglContext(*this);
+
+    const auto       FBO = readFramebuffer(buf);
+    if (!FBO)
+        return;
+
+    const auto& dma = buf->dmabuf();
+    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, FBO));
     GLCALL(proc.glReadnPixelsEXT(0, 0, dma.size.x, dma.size.y, GL_RGBA, GL_UNSIGNED_BYTE, out.size(), out.data()));
 
     GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+}
+
+bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstStride, GLenum glFormat, const CRegion& region, int waitFD) {
+    if (!from || !dst || dstStride % 4 != 0)
+        return false;
+
+    CEglContextGuard eglContext(*this);
+
+    // the client may still be rendering into `from`
+    if (waitFD >= 0 && !CFileDescriptor::isReadable(waitFD))
+        waitOnSync(waitFD);
+
+    const auto FBO = readFramebuffer(from);
+    if (!FBO)
+        return false;
+
+    const auto SIZE    = from->dmabuf().size;
+    CRegion    clipped = region.copy(); // intersect() returns a reference: keep the copy alive
+    clipped.intersect(0, 0, SIZE.x, SIZE.y);
+
+    // the image's first row is GL's y = 0, so a rect maps 1:1 onto the destination memory
+    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, FBO));
+    GLCALL(glPixelStorei(GL_PACK_ALIGNMENT, 4));
+    GLCALL(glPixelStorei(GL_PACK_ROW_LENGTH, dstStride / 4));
+
+    bool ok = true;
+    clipped.forEachRect([&](const pixman_box32_t& r) {
+        const int W = r.x2 - r.x1, H = r.y2 - r.y1;
+        if (W <= 0 || H <= 0)
+            return;
+        glReadPixels(r.x1, r.y1, W, H, glFormat, GL_UNSIGNED_BYTE, dst + (size_t)r.y1 * dstStride + (size_t)r.x1 * 4);
+        if (const auto ERR = glGetError(); ERR != GL_NO_ERROR) {
+            backend->log(AQ_LOG_ERROR, std::format("EGL (readRegionInto): glReadPixels failed: 0x{:x}", ERR));
+            ok = false;
+        }
+    });
+
+    GLCALL(glPixelStorei(GL_PACK_ROW_LENGTH, 0));
+    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+    return ok;
 }
 
 void CDRMRenderer::waitOnSync(int fd) {
