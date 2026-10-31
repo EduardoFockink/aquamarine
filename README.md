@@ -96,6 +96,10 @@ The new library is only picked up by a new compositor session (log out and back 
 package file around: if the session does not come up, switch to a TTY and reinstall it with
 `sudo pacman -U <previous>.pkg.tar.zst`, or install the official package with `sudo pacman -S aquamarine`.
 
+[`tools/safe-test.sh`](tools/safe-test.sh) automates that: armed before logging out, it rolls back to the
+previous package and restarts the display manager unless the new login is confirmed within 90 s, so a
+build that leaves the screen unusable fixes itself.
+
 To refresh the patches after changing a code branch: `./export-patches.sh v0.15.1 mgpu-cpu-copy-0.15.1`,
 then `updpkgsums`.
 
