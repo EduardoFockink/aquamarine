@@ -1,0 +1,13 @@
+# makepkg
+/src/
+/pkg/
+*.pkg.tar.*
+*.tar.gz
+*.log
+
+# compiled tests
+/tests/*
+!/tests/*.c
+!/tests/*.cpp
+!/tests/*.inc
+!/tests/README.md

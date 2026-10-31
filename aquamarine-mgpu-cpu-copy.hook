@@ -1,0 +1,14 @@
+# Install to /etc/pacman.d/hooks/. Warns when a transaction is about to replace the patched aquamarine
+# (AQ_MGPU_CPU_COPY) with another build, typically a new official version. It blocks nothing: with the
+# markers gone, a compositor config that checks them falls back on the next login instead of looping.
+# Note: it also fires when you upgrade from one patched build to the next; then the markers come back.
+[Trigger]
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = aquamarine
+
+[Action]
+Description = Checking for the patched aquamarine (AQ_MGPU_CPU_COPY)...
+When = PreTransaction
+Exec = /usr/bin/sh -c 'if [ -e /usr/share/aquamarine/mgpu-cpu-copy ]; then echo; echo "  >>> The installed aquamarine has the AQ_MGPU_CPU_COPY patch and is being replaced."; echo "  >>> If the new package is not a patched build, nvidia-usbc mode stops working on the next login."; echo "  >>> Rebuild from https://github.com/EduardoFockink/aquamarine (branch packaging) for the new version."; echo; fi'

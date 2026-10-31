@@ -1,0 +1,279 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eduardo Fockink <54868856+EduardoFockink@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 18:50:42 -0300
+Subject: [PATCH 2/3] drm: AQ_MGPU_CPU_COPY: support 10-bit (X/A*2101010)
+ outputs for HDR
+
+Reading a 2101010 buffer into CPU memory is a software conversion in the
+NVIDIA driver: ~330 ms for a 5120x2160 frame, unusable. Instead a small
+shader on the primary repacks each pixel's 32-bit word into an RGBA8
+renderbuffer (only the scissored damaged rects), and that is read back on
+the fast 8-bit path, byte-identical to the X*2101010 layout.
+
+The dumb buffer is always allocated opaque (X*2101010): planes commonly
+scan out [XA]RGB8888 and X*2101010 but not A*2101010 (Intel gen9 does
+not). readRegionInto() now takes an eCpuCopyLayout instead of a GL format.
+
+Verified word by word on the GTX 1050 Ti for both XBGR2101010 and
+XRGB2101010. This makes HDR (bitdepth 10) usable on the Intel-driven
+output.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/backend/drm/DRM.cpp      |  24 +++++--
+ src/backend/drm/Renderer.cpp | 126 +++++++++++++++++++++++++++++++++--
+ src/backend/drm/Renderer.hpp |  24 ++++++-
+ 3 files changed, 160 insertions(+), 14 deletions(-)
+
+diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp
+index fc964cf..1838b17 100644
+--- a/src/backend/drm/DRM.cpp
++++ b/src/backend/drm/DRM.cpp
+@@ -2685,13 +2685,27 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+                 return false;
+             }
+ 
++            // the dumb buffer gets the same layout as the primary's buffer, except that 10 bit always goes opaque:
++            // planes often scan out [XA]RGB8888 and X*2101010 but not A*2101010 (Intel gen9 doesn't)
++            using eLayout       = CDRMRenderer::eCpuCopyLayout;
+             const auto DMA      = STATE.buffer->dmabuf();
+-            GLenum     glFormat = 0;
++            eLayout    layout   = eLayout::BGRA8;
++            uint32_t   dumbFmt  = DMA.format;
+             switch (DMA.format) {
+                 case DRM_FORMAT_XRGB8888:
+-                case DRM_FORMAT_ARGB8888: glFormat = GL_BGRA_EXT; break;
++                case DRM_FORMAT_ARGB8888: layout = eLayout::BGRA8; break;
+                 case DRM_FORMAT_XBGR8888:
+-                case DRM_FORMAT_ABGR8888: glFormat = GL_RGBA; break;
++                case DRM_FORMAT_ABGR8888: layout = eLayout::RGBA8; break;
++                case DRM_FORMAT_XBGR2101010:
++                case DRM_FORMAT_ABGR2101010:
++                    layout  = eLayout::XBGR2101010;
++                    dumbFmt = DRM_FORMAT_XBGR2101010;
++                    break;
++                case DRM_FORMAT_XRGB2101010:
++                case DRM_FORMAT_ARGB2101010:
++                    layout  = eLayout::XRGB2101010;
++                    dumbFmt = DRM_FORMAT_XRGB2101010;
++                    break;
+                 default:
+                     backend->backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MGPU_CPU_COPY: unsupported format {}", fourccToName(DMA.format)));
+                     return false;
+@@ -2709,7 +2723,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+ 
+             auto OPTIONS   = copy.swapchain->currentOptions();
+             OPTIONS.size   = STATE.buffer->size;
+-            OPTIONS.format = DMA.format;
++            OPTIONS.format = dumbFmt;
+             OPTIONS.length = 2;
+             OPTIONS.cursor = false;
+             if (const auto& CUR = copy.swapchain->currentOptions(); CUR.size != OPTIONS.size || CUR.format != OPTIONS.format || CUR.length != OPTIONS.length) {
+@@ -2745,7 +2759,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+             const auto [PTR, FMT, LEN] = BUF->beginDataPtr(0);
+             const auto STRIDE          = BUF->dmabuf().strides.at(0);
+             const bool COPIED          = PTR &&
+-                PRIMARY_RENDERER->readRegionInto(STATE.buffer, PTR, STRIDE, glFormat, toCopy,
++                PRIMARY_RENDERER->readRegionInto(STATE.buffer, PTR, STRIDE, layout, toCopy,
+                                                  (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
+             BUF->endDataPtr();
+             if (!COPIED) {
+diff --git a/src/backend/drm/Renderer.cpp b/src/backend/drm/Renderer.cpp
+index bb9ea75..1ade79a 100644
+--- a/src/backend/drm/Renderer.cpp
++++ b/src/backend/drm/Renderer.cpp
+@@ -824,7 +824,117 @@ void CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, st
+     GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+ }
+ 
+-bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstStride, GLenum glFormat, const CRegion& region, int waitFD) {
++inline const std::string VERT_SRC_PACK = R"#(#version 300 es
++void main() {
++    // one triangle over the whole viewport: the scissor picks the rect
++    vec2 pos = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
++    gl_Position = vec4(pos, 0.0, 1.0);
++})#";
++
++static std::string packFragSrc(bool external) {
++    return std::string("#version 300 es\n") + (external ? "#extension GL_OES_EGL_image_external_essl3 : require\n" : "") + R"#(
++precision highp float;
++precision highp int;
++
++uniform highp )#" + (external ? "samplerExternalOES" : "sampler2D") + R"#( tex;
++uniform vec2 invSize;
++uniform int swapRB;
++out vec4 fragColor;
++
++void main() {
++    // the image's first row is GL's y = 0 both in tex and in the target: no flip
++    vec3  c = texture(tex, gl_FragCoord.xy * invSize).rgb;
++    uvec3 v = uvec3(round(clamp(c, 0.0, 1.0) * 1023.0));
++    if (swapRB == 1)
++        v = v.bgr;
++    // the X*2101010 word, split into its 4 bytes (lowest first) so an RGBA8 readback stores it as is
++    uint w = v.r | (v.g << 10u) | (v.b << 20u) | (3u << 30u);
++    fragColor = vec4(uvec4(w, w >> 8u, w >> 16u, w >> 24u) & 255u) / 255.0;
++})#";
++}
++
++// Repacks `region` of the 10 bit buffer `from` into cpuCopyPack's RGBA8 FBO (see Renderer.hpp) and returns that FBO,
++// or 0 on failure. Needs a current context.
++GLuint CDRMRenderer::packFramebuffer(SP<IBuffer> from, const CRegion& region, bool swapRB) {
++    // `from`'s texture, cached like blit() does
++    auto att = from->attachments.get<CDRMRendererBufferInputAttachment>();
++    if (!att || att->renderer != self) {
++        att = makeShared<CDRMRendererBufferInputAttachment>(self, glTex(from), std::vector<uint8_t>());
++        from->attachments.add(att);
++    }
++    if (!att->tex || !att->tex->image || !att->tex->texid) {
++        backend->log(AQ_LOG_ERROR, "EGL (packFramebuffer): no texture for the source buffer");
++        return 0;
++    }
++
++    auto&      pack = cpuCopyPack;
++    const int  I    = att->tex->target == GL_TEXTURE_EXTERNAL_OES ? 1 : 0;
++    const auto SIZE = from->dmabuf().size;
++
++    if (!pack.program[I]) {
++        pack.program[I] = createProgram(VERT_SRC_PACK, packFragSrc(I == 1));
++        if (!pack.program[I]) {
++            backend->log(AQ_LOG_ERROR, "EGL (packFramebuffer): 10 bit pack shader failed");
++            return 0;
++        }
++        pack.tex[I]     = glGetUniformLocation(pack.program[I], "tex");
++        pack.invSize[I] = glGetUniformLocation(pack.program[I], "invSize");
++        pack.swapRB[I]  = glGetUniformLocation(pack.program[I], "swapRB");
++    }
++
++    if (!pack.vao)
++        GLCALL(glGenVertexArrays(1, &pack.vao));
++
++    if (!pack.fbo || pack.size != SIZE) {
++        if (!pack.rbo)
++            GLCALL(glGenRenderbuffers(1, &pack.rbo));
++        if (!pack.fbo)
++            GLCALL(glGenFramebuffers(1, &pack.fbo));
++
++        GLCALL(glBindRenderbuffer(GL_RENDERBUFFER, pack.rbo));
++        GLCALL(glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, SIZE.x, SIZE.y));
++        GLCALL(glBindRenderbuffer(GL_RENDERBUFFER, 0));
++        GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, pack.fbo));
++        GLCALL(glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, pack.rbo));
++
++        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++            backend->log(AQ_LOG_ERROR, std::format("EGL (packFramebuffer): glCheckFramebufferStatus failed: {}", glGetError()));
++            pack.size = {};
++            return 0;
++        }
++        pack.size = SIZE;
++        backend->log(AQ_LOG_DEBUG, std::format("EGL (packFramebuffer): 10 bit pack target is {}x{}", SIZE.x, SIZE.y));
++    }
++
++    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, pack.fbo));
++    GLCALL(glViewport(0, 0, SIZE.x, SIZE.y));
++    GLCALL(glDisable(GL_BLEND));
++    useProgram(pack.program[I]);
++
++    GLCALL(glActiveTexture(GL_TEXTURE0));
++    att->tex->bind();
++    att->tex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    att->tex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    GLCALL(glUniform1i(pack.tex[I], 0));
++    GLCALL(glUniform2f(pack.invSize[I], 1.F / SIZE.x, 1.F / SIZE.y));
++    GLCALL(glUniform1i(pack.swapRB[I], swapRB ? 1 : 0));
++    GLCALL(glBindVertexArray(pack.vao));
++
++    GLCALL(glEnable(GL_SCISSOR_TEST));
++    region.forEachRect([&](const pixman_box32_t& r) {
++        if (r.x2 <= r.x1 || r.y2 <= r.y1)
++            return;
++        glScissor(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++    });
++    GLCALL(glDisable(GL_SCISSOR_TEST));
++
++    GLCALL(glBindVertexArray(0));
++    att->tex->unbind();
++    return pack.fbo;
++}
++
++bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstStride, eCpuCopyLayout layout, const CRegion& region, int waitFD) {
+     if (!from || !dst || dstStride % 4 != 0)
+         return false;
+ 
+@@ -834,14 +944,18 @@ bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstSt
+     if (waitFD >= 0 && !CFileDescriptor::isReadable(waitFD))
+         waitOnSync(waitFD);
+ 
+-    const auto FBO = readFramebuffer(from);
+-    if (!FBO)
+-        return false;
+-
+     const auto SIZE    = from->dmabuf().size;
+     CRegion    clipped = region.copy(); // intersect() returns a reference: keep the copy alive
+     clipped.intersect(0, 0, SIZE.x, SIZE.y);
+ 
++    const bool PACKED = layout == eCpuCopyLayout::XBGR2101010 || layout == eCpuCopyLayout::XRGB2101010;
++    const auto FBO    = PACKED ? packFramebuffer(from, clipped, layout == eCpuCopyLayout::XRGB2101010) : readFramebuffer(from);
++    if (!FBO)
++        return false;
++
++    // packed pixels are already the final bytes in R, G, B, A order
++    const GLenum GLFORMAT = layout == eCpuCopyLayout::BGRA8 ? GL_BGRA_EXT : GL_RGBA;
++
+     // the image's first row is GL's y = 0, so a rect maps 1:1 onto the destination memory
+     GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, FBO));
+     GLCALL(glPixelStorei(GL_PACK_ALIGNMENT, 4));
+@@ -852,7 +966,7 @@ bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstSt
+         const int W = r.x2 - r.x1, H = r.y2 - r.y1;
+         if (W <= 0 || H <= 0)
+             return;
+-        glReadPixels(r.x1, r.y1, W, H, glFormat, GL_UNSIGNED_BYTE, dst + (size_t)r.y1 * dstStride + (size_t)r.x1 * 4);
++        glReadPixels(r.x1, r.y1, W, H, GLFORMAT, GL_UNSIGNED_BYTE, dst + (size_t)r.y1 * dstStride + (size_t)r.x1 * 4);
+         if (const auto ERR = glGetError(); ERR != GL_NO_ERROR) {
+             backend->log(AQ_LOG_ERROR, std::format("EGL (readRegionInto): glReadPixels failed: 0x{:x}", ERR));
+             ok = false;
+diff --git a/src/backend/drm/Renderer.hpp b/src/backend/drm/Renderer.hpp
+index 5124b4d..2ec20bd 100644
+--- a/src/backend/drm/Renderer.hpp
++++ b/src/backend/drm/Renderer.hpp
+@@ -104,11 +104,18 @@ namespace Aquamarine {
+         SBlitResult blit(Hyprutils::Memory::CSharedPointer<IBuffer> from, Hyprutils::Memory::CSharedPointer<IBuffer> to,
+                          Hyprutils::Memory::CSharedPointer<CDRMRenderer> primaryRenderer, int waitFD = -1);
+ 
++        // Memory layout readRegionInto writes, 4 bytes per pixel. Pick the one matching `from`'s format.
++        enum class eCpuCopyLayout : uint8_t {
++            BGRA8,       // [AX]RGB8888
++            RGBA8,       // [AX]BGR8888
++            XBGR2101010, // [AX]BGR2101010 (alpha bits set)
++            XRGB2101010, // [AX]RGB2101010 (alpha bits set)
++        };
++
+         // Reads only `region` of `from` (a buffer this renderer can import) straight into CPU memory at `dst`,
+-        // laid out like `from` with `dstStride` bytes per row. glFormat is GL_BGRA_EXT for [AX]RGB8888 and
+-        // GL_RGBA for [AX]BGR8888. Synchronous: when it returns, the pixels are in `dst`.
++        // laid out as `layout` with `dstStride` bytes per row. Synchronous: when it returns, the pixels are in `dst`.
+         // Used by AQ_MGPU_CPU_COPY so the secondary GPU never reads (or renders from) the primary's buffers.
+-        bool readRegionInto(Hyprutils::Memory::CSharedPointer<IBuffer> from, uint8_t* dst, uint32_t dstStride, GLenum glFormat, const Hyprutils::Math::CRegion& region,
++        bool readRegionInto(Hyprutils::Memory::CSharedPointer<IBuffer> from, uint8_t* dst, uint32_t dstStride, eCpuCopyLayout layout, const Hyprutils::Math::CRegion& region,
+                             int waitFD = -1);
+         // can't be a SP<> because we call it from buf's ctor...
+         void clearBuffer(IBuffer* buf);
+@@ -171,6 +178,17 @@ namespace Aquamarine {
+ 
+         EGLImageKHR                                           createEGLImage(const SDMABUFAttrs& attrs);
+         GLuint                                                readFramebuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf);
++        GLuint                                                packFramebuffer(Hyprutils::Memory::CSharedPointer<IBuffer> from, const Hyprutils::Math::CRegion& region, bool swapRB);
++
++        // readRegionInto for 10 bit: the driver can't read 2101010 into CPU memory quickly (NVIDIA converts in
++        // software, ~330 ms for 5120x2160), so a shader first repacks each pixel's 32-bit word into an RGBA8
++        // renderbuffer, which reads back on the fast 8 bit path. Created on first use.
++        struct {
++            GLuint                    program[2] = {0, 0}; // GL_TEXTURE_2D, GL_TEXTURE_EXTERNAL_OES
++            GLint                     tex[2] = {-1, -1}, invSize[2] = {-1, -1}, swapRB[2] = {-1, -1};
++            GLuint                    vao = 0, fbo = 0, rbo = 0;
++            Hyprutils::Math::Vector2D size;
++        } cpuCopyPack;
+         bool                                                  verifyDestinationDMABUF(const SDMABUFAttrs& attrs);
+         void                                                  waitOnSync(int fd);
+         int                                                   recreateBlitSync();

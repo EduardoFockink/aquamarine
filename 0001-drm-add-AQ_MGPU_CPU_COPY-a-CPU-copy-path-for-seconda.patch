@@ -1,0 +1,352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eduardo Fockink <54868856+EduardoFockink@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 18:50:42 -0300
+Subject: [PATCH 1/3] drm: add AQ_MGPU_CPU_COPY, a CPU copy path for
+ secondary-GPU outputs
+
+On a hybrid laptop where the NVIDIA proprietary driver renders and the
+display is wired to the Intel iGPU (USB-C/DP alt mode on a Dell G7 7588:
+GTX 1050 Ti + UHD 630), the regular multi-GPU blit cannot work. The
+secondary has to import the primary's buffer, NVIDIA cannot allocate the
+LINEAR buffers that would make that possible, and the Intel/Mesa side
+aborts when it imports the BLOCK_LINEAR one, which breaks login.
+
+With AQ_MGPU_CPU_COPY=1 the secondary never imports or renders from the
+primary's buffers. Instead, for an output on the secondary GPU:
+
+- GBM: multi-GPU buffers keep the primary's native layout (no forced
+  LINEAR), since only the primary reads them back.
+- DRM: commitState() keeps a 2-buffer swapchain of linear dumb buffers on
+  the secondary. The primary reads only the damaged region (plus the
+  damage of the frames in between, as the swapchain rotates) straight
+  into the CPU-mapped dumb buffer, which the secondary only scans out.
+  Async commits are sent down the synchronous path.
+- Renderer: readRegionInto() reads a region of a buffer into CPU memory
+  with a given stride, sharing the FBO setup with readBuffer().
+
+Cost scales with damage: ~0.2 ms of CPU per changed text line; a 5120x2160
+full-frame copy is ~4.3 ms of CPU. 8-bit formats only ([AX]RGB8888,
+[AX]BGR8888). AQ_MGPU_CPU_COPY_FULL=1 ignores damage (debug).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/allocator/GBM.cpp        |  11 ++++
+ src/backend/drm/DRM.cpp      | 122 ++++++++++++++++++++++++++++++++++-
+ src/backend/drm/Renderer.cpp |  66 ++++++++++++++++---
+ src/backend/drm/Renderer.hpp |   8 +++
+ 4 files changed, 198 insertions(+), 9 deletions(-)
+
+diff --git a/src/allocator/GBM.cpp b/src/allocator/GBM.cpp
+index 6f596b7..33d206b 100644
+--- a/src/allocator/GBM.cpp
++++ b/src/allocator/GBM.cpp
+@@ -162,6 +162,14 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
+         explicitModifiers = {DRM_FORMAT_MOD_LINEAR};
+     }
+ 
++    // AQ_MGPU_CPU_COPY: the secondary GPU never imports this buffer (the primary reads it back itself, see DRM.cpp),
++    // so don't restrict it to layouts the secondary understands (often just LINEAR, which Nvidia can't allocate).
++    static const bool MGPU_CPU_COPY = envEnabled("AQ_MGPU_CPU_COPY");
++    if (MULTIGPU && MGPU_CPU_COPY) {
++        allocator->backend->log(AQ_LOG_DEBUG, "GBM: Buffer is marked as multigpu, AQ_MGPU_CPU_COPY: using the primary's native layout");
++        explicitModifiers.clear();
++    }
++
+     uint32_t flags = GBM_BO_USE_RENDERING;
+     if (params.scanout && !MULTIGPU)
+         flags |= GBM_BO_USE_SCANOUT;
+@@ -171,6 +179,9 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
+     if (explicitModifiers.empty()) {
+         allocator->backend->log(AQ_LOG_WARNING, "GBM: Using modifier-less allocation");
+         bo = gbm_bo_create(allocator->gbmDevice, attrs.size.x, attrs.size.y, attrs.format, flags);
++        // the primary reads this buffer back through EGL, which needs its real layout, not "implicit"
++        if (bo && MULTIGPU && MGPU_CPU_COPY)
++            modifier = gbm_bo_get_modifier(bo);
+     } else {
+         TRACE(allocator->backend->log(AQ_LOG_TRACE, std::format("GBM: Using modifier-based allocation, modifiers: {}", explicitModifiers.size())));
+         for (auto const& mod : explicitModifiers) {
+diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp
+index 431247b..fc964cf 100644
+--- a/src/backend/drm/DRM.cpp
++++ b/src/backend/drm/DRM.cpp
+@@ -48,6 +48,30 @@ using namespace Hyprutils::Memory;
+ using namespace Hyprutils::Math;
+ #define SP CSharedPointer
+ 
++// AQ_MGPU_CPU_COPY: for an output on a secondary GPU, the secondary never imports or renders from the primary's
++// buffer (that needs both drivers to agree on a memory layout, and an NVIDIA primary + Intel secondary aborts in
++// Mesa). Instead the primary reads only the damaged region straight into a linear, CPU-mapped dumb buffer of the
++// secondary, which just scans it out. State lives here, not in CDRMOutput, so the public header and ABI stay as is.
++namespace {
++    struct SMgpuCpuCopy {
++        SP<CDRMDumbAllocator> allocator;
++        SP<CSwapchain>        swapchain;
++        std::deque<CRegion>   damage; // newest first, one entry per written frame
++        size_t                framesWritten = 0;
++    };
++    // Never destroyed on purpose: compositors keep the backend in a global, so outputs can be destroyed during
++    // exit() after this library's statics are already gone (a plain static map crashed Hyprland on exit).
++    std::unordered_map<const CDRMOutput*, SMgpuCpuCopy>& mgpuCpuCopies() {
++        static auto* copies = new std::unordered_map<const CDRMOutput*, SMgpuCpuCopy>();
++        return *copies;
++    }
++
++    bool mgpuCpuCopyEnabled() {
++        static const bool ENABLED = envEnabled("AQ_MGPU_CPU_COPY");
++        return ENABLED;
++    }
++}
++
+ static bool shouldSubmitCTM(SP<SDRMConnector> connector, const COutputState::SInternalState& state, bool modeset) {
+     if (state.committed & COutputState::AQ_OUTPUT_STATE_CTM)
+         return true;
+@@ -2335,11 +2359,13 @@ Aquamarine::CDRMOutput::~CDRMOutput() {
+         backend->backend->removeIdleEvent(frameIdle);
+     connector->sched.onFrameComplete();
+     connector->sched.setFrameScheduled(false);
++    mgpuCpuCopies().erase(this);
+ }
+ 
+ void Aquamarine::CDRMOutput::releaseMgpuResources() {
+     mgpu.swapchain.reset();
+     mgpu.cursorSwapchain.reset();
++    mgpuCpuCopies().erase(this);
+ 
+     if (swapchain) {
+         auto options   = swapchain->currentOptions();
+@@ -2394,6 +2420,12 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
+ 
+     SP<CDRMFB> drmFB;
+     if (backend->shouldBlit()) {
++        // the CPU copy only runs in commitState(): send these commits down the synchronous path
++        if (mgpuCpuCopyEnabled()) {
++            requiresSync = true;
++            return false;
++        }
++
+         if (!backend->rendererState.renderer) {
+             backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for asynchronous blitting, initializing");
+             if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
+@@ -2642,7 +2674,95 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+ 
+         if (blittedFB)
+             drmFB = blittedFB;
+-        else if (backend->shouldBlit()) {
++        else if (backend->shouldBlit() && mgpuCpuCopyEnabled()) {
++            // see SMgpuCpuCopy: the primary GPU reads the damaged region into a linear dumb buffer of this GPU
++            const auto PRIMARY = backend->primary.lock();
++            if (PRIMARY && !PRIMARY->rendererState.renderer)
++                PRIMARY->initMgpu();
++            const auto PRIMARY_RENDERER = PRIMARY ? PRIMARY->rendererState.renderer : nullptr;
++            if (!PRIMARY_RENDERER) {
++                backend->backend->log(AQ_LOG_ERROR, "drm: AQ_MGPU_CPU_COPY: no renderer on the primary GPU");
++                return false;
++            }
++
++            const auto DMA      = STATE.buffer->dmabuf();
++            GLenum     glFormat = 0;
++            switch (DMA.format) {
++                case DRM_FORMAT_XRGB8888:
++                case DRM_FORMAT_ARGB8888: glFormat = GL_BGRA_EXT; break;
++                case DRM_FORMAT_XBGR8888:
++                case DRM_FORMAT_ABGR8888: glFormat = GL_RGBA; break;
++                default:
++                    backend->backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MGPU_CPU_COPY: unsupported format {}", fourccToName(DMA.format)));
++                    return false;
++            }
++
++            auto& copy = mgpuCpuCopies()[this];
++            if (!copy.allocator) {
++                copy.allocator = CDRMDumbAllocator::create(backend->gpu->fd, backend->backend);
++                if (!copy.allocator) {
++                    backend->backend->log(AQ_LOG_ERROR, "drm: AQ_MGPU_CPU_COPY: no dumb allocator on the secondary GPU");
++                    return false;
++                }
++                copy.swapchain = CSwapchain::create(copy.allocator, backend.lock());
++            }
++
++            auto OPTIONS   = copy.swapchain->currentOptions();
++            OPTIONS.size   = STATE.buffer->size;
++            OPTIONS.format = DMA.format;
++            OPTIONS.length = 2;
++            OPTIONS.cursor = false;
++            if (const auto& CUR = copy.swapchain->currentOptions(); CUR.size != OPTIONS.size || CUR.format != OPTIONS.format || CUR.length != OPTIONS.length) {
++                if (!copy.swapchain->reconfigure(OPTIONS)) {
++                    backend->backend->log(AQ_LOG_ERROR, "drm: AQ_MGPU_CPU_COPY: swapchain failed reconfiguring");
++                    return false;
++                }
++                copy.damage.clear();
++                copy.framesWritten = 0;
++            }
++
++            CRegion full;
++            full.add(0, 0, OPTIONS.size.x, OPTIONS.size.y);
++            static const bool ALWAYS_FULL = envEnabled("AQ_MGPU_CPU_COPY_FULL"); // debug: ignore damage
++            const bool        HAS_DAMAGE  = (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_DAMAGE) && !STATE.damage.empty();
++            CRegion           damage      = (HAS_DAMAGE && !ALWAYS_FULL) ? STATE.damage.copy() : full.copy();
++
++            // the swapchain rotates, so the buffer we get was last written OPTIONS.length frames ago:
++            // bring it up to date with this frame's damage plus the damage of the frames in between
++            CRegion toCopy = damage.copy();
++            if (copy.framesWritten < (size_t)OPTIONS.length)
++                toCopy = full.copy();
++            else
++                for (size_t i = 0; i + 1 < (size_t)OPTIONS.length && i < copy.damage.size(); ++i)
++                    toCopy.add(copy.damage[i]);
++
++            const auto BUF = copy.swapchain->next(nullptr);
++            if (!BUF) {
++                backend->backend->log(AQ_LOG_ERROR, "drm: AQ_MGPU_CPU_COPY: swapchain has no buffer");
++                return false;
++            }
++
++            const auto [PTR, FMT, LEN] = BUF->beginDataPtr(0);
++            const auto STRIDE          = BUF->dmabuf().strides.at(0);
++            const bool COPIED          = PTR &&
++                PRIMARY_RENDERER->readRegionInto(STATE.buffer, PTR, STRIDE, glFormat, toCopy,
++                                                 (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
++            BUF->endDataPtr();
++            if (!COPIED) {
++                backend->backend->log(AQ_LOG_ERROR, "drm: AQ_MGPU_CPU_COPY: reading the primary's buffer failed");
++                return false;
++            }
++
++            copy.damage.push_front(std::move(damage));
++            while (copy.damage.size() > (size_t)OPTIONS.length)
++                copy.damage.pop_back();
++            ++copy.framesWritten;
++
++            // the pixels are already in place: there is nothing for KMS to wait on
++            data.outputState.explicitInFence = -1;
++
++            drmFB = CDRMFB::create(BUF, backend, nullptr);
++        } else if (backend->shouldBlit()) {
+             if (!backend->rendererState.renderer) {
+                 backend->backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for blitting, initializing");
+                 if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
+diff --git a/src/backend/drm/Renderer.cpp b/src/backend/drm/Renderer.cpp
+index d221775..bb9ea75 100644
+--- a/src/backend/drm/Renderer.cpp
++++ b/src/backend/drm/Renderer.cpp
+@@ -777,20 +777,19 @@ CGLTex CDRMRenderer::glTex(Hyprutils::Memory::CSharedPointer<IBuffer> buffa) {
+ 
+ constexpr GLenum PIXEL_BUFFER_FORMAT = GL_RGBA;
+ 
+-void             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out) {
+-    CEglContextGuard eglContext(*this);
+-    auto             att = buf->attachments.get<CDRMRendererBufferOutputAttachment>();
++// Returns an FBO (cached in buf's output attachment) to read buf from, or 0 on failure. Needs a current context.
++GLuint CDRMRenderer::readFramebuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf) {
++    auto att = buf->attachments.get<CDRMRendererBufferOutputAttachment>();
+     if (!att || att->renderer != self) {
+         att = makeShared<CDRMRendererBufferOutputAttachment>(self, nullptr, 0, 0);
+         buf->attachments.add(att);
+     }
+ 
+-    const auto& dma = buf->dmabuf();
+     if (!att->eglImage) {
+-        att->eglImage = createEGLImage(dma);
++        att->eglImage = createEGLImage(buf->dmabuf());
+         if (att->eglImage == EGL_NO_IMAGE_KHR) {
+             backend->log(AQ_LOG_ERROR, std::format("EGL (readBuffer): createEGLImage failed: {}", eglGetError()));
+-            return;
++            return 0;
+         }
+ 
+         GLCALL(glGenRenderbuffers(1, &att->rbo));
+@@ -804,16 +803,67 @@ void             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuf
+ 
+         if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+             backend->log(AQ_LOG_ERROR, std::format("EGL (readBuffer): glCheckFramebufferStatus failed: {}", glGetError()));
+-            return;
++            return 0;
+         }
+     }
+ 
+-    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, att->fbo));
++    return att->fbo;
++}
++
++void CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out) {
++    CEglContextGuard eglContext(*this);
++
++    const auto       FBO = readFramebuffer(buf);
++    if (!FBO)
++        return;
++
++    const auto& dma = buf->dmabuf();
++    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, FBO));
+     GLCALL(proc.glReadnPixelsEXT(0, 0, dma.size.x, dma.size.y, GL_RGBA, GL_UNSIGNED_BYTE, out.size(), out.data()));
+ 
+     GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+ }
+ 
++bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstStride, GLenum glFormat, const CRegion& region, int waitFD) {
++    if (!from || !dst || dstStride % 4 != 0)
++        return false;
++
++    CEglContextGuard eglContext(*this);
++
++    // the client may still be rendering into `from`
++    if (waitFD >= 0 && !CFileDescriptor::isReadable(waitFD))
++        waitOnSync(waitFD);
++
++    const auto FBO = readFramebuffer(from);
++    if (!FBO)
++        return false;
++
++    const auto SIZE    = from->dmabuf().size;
++    CRegion    clipped = region.copy(); // intersect() returns a reference: keep the copy alive
++    clipped.intersect(0, 0, SIZE.x, SIZE.y);
++
++    // the image's first row is GL's y = 0, so a rect maps 1:1 onto the destination memory
++    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, FBO));
++    GLCALL(glPixelStorei(GL_PACK_ALIGNMENT, 4));
++    GLCALL(glPixelStorei(GL_PACK_ROW_LENGTH, dstStride / 4));
++
++    bool ok = true;
++    clipped.forEachRect([&](const pixman_box32_t& r) {
++        const int W = r.x2 - r.x1, H = r.y2 - r.y1;
++        if (W <= 0 || H <= 0)
++            return;
++        glReadPixels(r.x1, r.y1, W, H, glFormat, GL_UNSIGNED_BYTE, dst + (size_t)r.y1 * dstStride + (size_t)r.x1 * 4);
++        if (const auto ERR = glGetError(); ERR != GL_NO_ERROR) {
++            backend->log(AQ_LOG_ERROR, std::format("EGL (readRegionInto): glReadPixels failed: 0x{:x}", ERR));
++            ok = false;
++        }
++    });
++
++    GLCALL(glPixelStorei(GL_PACK_ROW_LENGTH, 0));
++    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
++    return ok;
++}
++
+ void CDRMRenderer::waitOnSync(int fd) {
+     TRACE(backend->log(AQ_LOG_TRACE, std::format("EGL (waitOnSync): attempting to wait on fd {}", fd)));
+ 
+diff --git a/src/backend/drm/Renderer.hpp b/src/backend/drm/Renderer.hpp
+index ca59dfa..5124b4d 100644
+--- a/src/backend/drm/Renderer.hpp
++++ b/src/backend/drm/Renderer.hpp
+@@ -103,6 +103,13 @@ namespace Aquamarine {
+ 
+         SBlitResult blit(Hyprutils::Memory::CSharedPointer<IBuffer> from, Hyprutils::Memory::CSharedPointer<IBuffer> to,
+                          Hyprutils::Memory::CSharedPointer<CDRMRenderer> primaryRenderer, int waitFD = -1);
++
++        // Reads only `region` of `from` (a buffer this renderer can import) straight into CPU memory at `dst`,
++        // laid out like `from` with `dstStride` bytes per row. glFormat is GL_BGRA_EXT for [AX]RGB8888 and
++        // GL_RGBA for [AX]BGR8888. Synchronous: when it returns, the pixels are in `dst`.
++        // Used by AQ_MGPU_CPU_COPY so the secondary GPU never reads (or renders from) the primary's buffers.
++        bool readRegionInto(Hyprutils::Memory::CSharedPointer<IBuffer> from, uint8_t* dst, uint32_t dstStride, GLenum glFormat, const Hyprutils::Math::CRegion& region,
++                            int waitFD = -1);
+         // can't be a SP<> because we call it from buf's ctor...
+         void clearBuffer(IBuffer* buf);
+ 
+@@ -163,6 +170,7 @@ namespace Aquamarine {
+         CDRMRenderer() = default;
+ 
+         EGLImageKHR                                           createEGLImage(const SDMABUFAttrs& attrs);
++        GLuint                                                readFramebuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf);
+         bool                                                  verifyDestinationDMABUF(const SDMABUFAttrs& attrs);
+         void                                                  waitOnSync(int fd);
+         int                                                   recreateBlitSync();
