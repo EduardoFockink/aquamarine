@@ -189,6 +189,13 @@ namespace Aquamarine {
             GLuint                    vao = 0, fbo = 0, rbo = 0;
             Hyprutils::Math::Vector2D size;
         } cpuCopyPack;
+
+        // Blocks until the GPU has finished everything submitted on this context, asleep in the kernel on a native
+        // fence. The NVIDIA driver instead busy-waits inside glReadPixels: with video on the 5K output that wait
+        // burned most of Hyprland's ~60% CPU (measured 2026-10-31, mgpu_bench_pbo.cpp). If no fence can be made it
+        // returns at once and glReadPixels waits as before.
+        void waitForGpuAsleep();
+
         bool                                                  verifyDestinationDMABUF(const SDMABUFAttrs& attrs);
         void                                                  waitOnSync(int fd);
         int                                                   recreateBlitSync();

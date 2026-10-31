@@ -3,7 +3,9 @@
 #include <xf86drmMode.h>
 #include <algorithm>
 #include <cstring>
+#include <cerrno>
 #include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 #include "Math.hpp"
 #include "Shared.hpp"
@@ -934,6 +936,31 @@ GLuint CDRMRenderer::packFramebuffer(SP<IBuffer> from, const CRegion& region, bo
     return pack.fbo;
 }
 
+void CDRMRenderer::waitForGpuAsleep() {
+    EGLSyncKHR sync = proc.eglCreateSyncKHR(egl.display, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
+    if (sync == EGL_NO_SYNC_KHR) {
+        TRACE(backend->log(AQ_LOG_TRACE, "EGL (waitForGpuAsleep): failed to create a native fence"));
+        return;
+    }
+
+    // we need to flush otherwise we might not get a valid fd
+    glFlush();
+
+    const int fd = proc.eglDupNativeFenceFDANDROID(egl.display, sync);
+    if (proc.eglDestroySyncKHR(egl.display, sync) != EGL_TRUE)
+        TRACE(backend->log(AQ_LOG_TRACE, "EGL (waitForGpuAsleep): failed to destroy sync"));
+    if (fd == EGL_NO_NATIVE_FENCE_FD_ANDROID) {
+        TRACE(backend->log(AQ_LOG_TRACE, "EGL (waitForGpuAsleep): failed to dup the fence fd"));
+        return;
+    }
+
+    pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    while (poll(&pfd, 1, 1000) < 0 && errno == EINTR) {
+        ;
+    }
+    close(fd);
+}
+
 bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstStride, eCpuCopyLayout layout, const CRegion& region, int waitFD) {
     if (!from || !dst || dstStride % 4 != 0)
         return false;
@@ -960,6 +987,10 @@ bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstSt
     GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, FBO));
     GLCALL(glPixelStorei(GL_PACK_ALIGNMENT, 4));
     GLCALL(glPixelStorei(GL_PACK_ROW_LENGTH, dstStride / 4));
+
+    static const bool SPIN = envEnabled("AQ_MGPU_CPU_COPY_SPIN"); // debug: let glReadPixels do the waiting
+    if (!SPIN)
+        waitForGpuAsleep();
 
     bool ok = true;
     clipped.forEachRect([&](const pixman_box32_t& r) {
