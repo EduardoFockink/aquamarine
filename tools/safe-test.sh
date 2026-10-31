@@ -1,7 +1,8 @@
 #!/usr/bin/bash
 # Dead-man switch for trying a new aquamarine build: unless the next login is confirmed in time, it reinstalls
 # the previous package and restarts the display manager (with autologin, the session comes back on the
-# package that worked). Written for SDDM autologin into Hyprland; adjust DM, USER_NAME and USER_UID otherwise.
+# package that worked). Written for SDDM autologin into Hyprland; override DM / COMPOSITOR otherwise. The
+# desktop user defaults to the owner of this script (USER_NAME to override).
 #
 # 1. Install the build under test (sudo pacman -U new.pkg.tar.zst).
 # 2. Arm this as root in a unit that survives the logout, passing the package to fall back to:
@@ -13,8 +14,8 @@
 # Rehearsal without touching anything: DRY=1 only prints what it would do; TEST=1 skips waiting for the
 # logout and treats the running compositor as the new one. Timeouts can be overridden from the environment.
 
-USER_NAME=${USER_NAME:-eduardo}
-USER_UID=${USER_UID:-1000}
+USER_NAME=${USER_NAME:-$(stat -c %U "$(readlink -f "$0")")}
+USER_UID=$(id -u "$USER_NAME")
 DM=${DM:-sddm}
 COMPOSITOR=${COMPOSITOR:-Hyprland}
 LOGOUT_WAIT=${LOGOUT_WAIT:-900} # s for the logout to happen
