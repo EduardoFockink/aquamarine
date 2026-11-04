@@ -27,7 +27,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 38 insertions(+)
 
 diff --git a/src/backend/drm/Renderer.cpp b/src/backend/drm/Renderer.cpp
-index 1ade79a..bd36dea 100644
+index b58cc62..0a31424 100644
 --- a/src/backend/drm/Renderer.cpp
 +++ b/src/backend/drm/Renderer.cpp
 @@ -3,7 +3,9 @@
@@ -40,7 +40,7 @@ index 1ade79a..bd36dea 100644
  #include <unistd.h>
  #include "Math.hpp"
  #include "Shared.hpp"
-@@ -934,6 +936,31 @@ GLuint CDRMRenderer::packFramebuffer(SP<IBuffer> from, const CRegion& region, bo
+@@ -941,6 +943,31 @@ GLuint CDRMRenderer::packFramebuffer(SP<IBuffer> from, const CRegion& region, bo
      return pack.fbo;
  }
  
@@ -72,7 +72,7 @@ index 1ade79a..bd36dea 100644
  bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstStride, eCpuCopyLayout layout, const CRegion& region, int waitFD) {
      if (!from || !dst || dstStride % 4 != 0)
          return false;
-@@ -961,6 +988,10 @@ bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstSt
+@@ -968,6 +995,10 @@ bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstSt
      GLCALL(glPixelStorei(GL_PACK_ALIGNMENT, 4));
      GLCALL(glPixelStorei(GL_PACK_ROW_LENGTH, dstStride / 4));
  
@@ -84,10 +84,10 @@ index 1ade79a..bd36dea 100644
      clipped.forEachRect([&](const pixman_box32_t& r) {
          const int W = r.x2 - r.x1, H = r.y2 - r.y1;
 diff --git a/src/backend/drm/Renderer.hpp b/src/backend/drm/Renderer.hpp
-index 2ec20bd..7f7932e 100644
+index 501a81f..97474a7 100644
 --- a/src/backend/drm/Renderer.hpp
 +++ b/src/backend/drm/Renderer.hpp
-@@ -189,6 +189,13 @@ namespace Aquamarine {
+@@ -197,6 +197,13 @@ namespace Aquamarine {
              GLuint                    vao = 0, fbo = 0, rbo = 0;
              Hyprutils::Math::Vector2D size;
          } cpuCopyPack;

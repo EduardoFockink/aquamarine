@@ -66,10 +66,10 @@ index 6f596b7..33d206b 100644
          TRACE(allocator->backend->log(AQ_LOG_TRACE, std::format("GBM: Using modifier-based allocation, modifiers: {}", explicitModifiers.size())));
          for (auto const& mod : explicitModifiers) {
 diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp
-index 431247b..fc964cf 100644
+index 688ed97..a89724c 100644
 --- a/src/backend/drm/DRM.cpp
 +++ b/src/backend/drm/DRM.cpp
-@@ -48,6 +48,30 @@ using namespace Hyprutils::Memory;
+@@ -49,6 +49,30 @@ using namespace Hyprutils::Memory;
  using namespace Hyprutils::Math;
  #define SP CSharedPointer
  
@@ -100,7 +100,7 @@ index 431247b..fc964cf 100644
  static bool shouldSubmitCTM(SP<SDRMConnector> connector, const COutputState::SInternalState& state, bool modeset) {
      if (state.committed & COutputState::AQ_OUTPUT_STATE_CTM)
          return true;
-@@ -2335,11 +2359,13 @@ Aquamarine::CDRMOutput::~CDRMOutput() {
+@@ -2339,11 +2363,13 @@ Aquamarine::CDRMOutput::~CDRMOutput() {
          backend->backend->removeIdleEvent(frameIdle);
      connector->sched.onFrameComplete();
      connector->sched.setFrameScheduled(false);
@@ -114,7 +114,7 @@ index 431247b..fc964cf 100644
  
      if (swapchain) {
          auto options   = swapchain->currentOptions();
-@@ -2394,6 +2420,12 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
+@@ -2398,6 +2424,12 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
  
      SP<CDRMFB> drmFB;
      if (backend->shouldBlit()) {
@@ -127,7 +127,7 @@ index 431247b..fc964cf 100644
          if (!backend->rendererState.renderer) {
              backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for asynchronous blitting, initializing");
              if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
-@@ -2642,7 +2674,95 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+@@ -2679,7 +2711,95 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
  
          if (blittedFB)
              drmFB = blittedFB;
@@ -225,14 +225,14 @@ index 431247b..fc964cf 100644
                  backend->backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for blitting, initializing");
                  if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
 diff --git a/src/backend/drm/Renderer.cpp b/src/backend/drm/Renderer.cpp
-index d221775..bb9ea75 100644
+index 718d79c..aa2abd9 100644
 --- a/src/backend/drm/Renderer.cpp
 +++ b/src/backend/drm/Renderer.cpp
 @@ -777,20 +777,19 @@ CGLTex CDRMRenderer::glTex(Hyprutils::Memory::CSharedPointer<IBuffer> buffa) {
  
  constexpr GLenum PIXEL_BUFFER_FORMAT = GL_RGBA;
  
--void             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out) {
+-bool             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out, GLenum format, uint32_t stride) {
 -    CEglContextGuard eglContext(*this);
 -    auto             att = buf->attachments.get<CDRMRendererBufferOutputAttachment>();
 +// Returns an FBO (cached in buf's output attachment) to read buf from, or 0 on failure. Needs a current context.
@@ -249,16 +249,16 @@ index d221775..bb9ea75 100644
 +        att->eglImage = createEGLImage(buf->dmabuf());
          if (att->eglImage == EGL_NO_IMAGE_KHR) {
              backend->log(AQ_LOG_ERROR, std::format("EGL (readBuffer): createEGLImage failed: {}", eglGetError()));
--            return;
+-            return false;
 +            return 0;
          }
  
          GLCALL(glGenRenderbuffers(1, &att->rbo));
-@@ -804,16 +803,67 @@ void             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuf
- 
-         if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+@@ -806,11 +805,22 @@ bool             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuf
              backend->log(AQ_LOG_ERROR, std::format("EGL (readBuffer): glCheckFramebufferStatus failed: {}", glGetError()));
--            return;
+             GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+             buf->attachments.remove(att);
+-            return false;
 +            return 0;
          }
      }
@@ -267,18 +267,20 @@ index d221775..bb9ea75 100644
 +    return att->fbo;
 +}
 +
-+void CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out) {
++bool CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out, GLenum format, uint32_t stride) {
 +    CEglContextGuard eglContext(*this);
 +
 +    const auto       FBO = readFramebuffer(buf);
 +    if (!FBO)
-+        return;
++        return false;
 +
 +    const auto& dma = buf->dmabuf();
 +    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, FBO));
-     GLCALL(proc.glReadnPixelsEXT(0, 0, dma.size.x, dma.size.y, GL_RGBA, GL_UNSIGNED_BYTE, out.size(), out.data()));
- 
-     GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+     if (stride)
+         GLCALL(glPixelStorei(GL_PACK_ROW_LENGTH, stride / 4));
+     GLCALL(proc.glReadnPixelsEXT(0, 0, dma.size.x, dma.size.y, format, GL_UNSIGNED_BYTE, out.size(), out.data()));
+@@ -821,6 +831,46 @@ bool             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuf
+     return true;
  }
  
 +bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstStride, GLenum glFormat, const CRegion& region, int waitFD) {
@@ -325,10 +327,10 @@ index d221775..bb9ea75 100644
      TRACE(backend->log(AQ_LOG_TRACE, std::format("EGL (waitOnSync): attempting to wait on fd {}", fd)));
  
 diff --git a/src/backend/drm/Renderer.hpp b/src/backend/drm/Renderer.hpp
-index ca59dfa..5124b4d 100644
+index 89a01c7..8d64b3f 100644
 --- a/src/backend/drm/Renderer.hpp
 +++ b/src/backend/drm/Renderer.hpp
-@@ -103,6 +103,13 @@ namespace Aquamarine {
+@@ -111,6 +111,13 @@ namespace Aquamarine {
  
          SBlitResult blit(Hyprutils::Memory::CSharedPointer<IBuffer> from, Hyprutils::Memory::CSharedPointer<IBuffer> to,
                           Hyprutils::Memory::CSharedPointer<CDRMRenderer> primaryRenderer, int waitFD = -1);
@@ -342,7 +344,7 @@ index ca59dfa..5124b4d 100644
          // can't be a SP<> because we call it from buf's ctor...
          void clearBuffer(IBuffer* buf);
  
-@@ -163,6 +170,7 @@ namespace Aquamarine {
+@@ -171,6 +178,7 @@ namespace Aquamarine {
          CDRMRenderer() = default;
  
          EGLImageKHR                                           createEGLImage(const SDMABUFAttrs& attrs);

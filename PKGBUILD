@@ -1,6 +1,6 @@
 # Maintainer: Eduardo Fockink <54868856+EduardoFockink@users.noreply.github.com>
 # Based on the official Arch package (Maintainer: Caleb Maclennan <caleb@alerque.com>); the only differences
-# are the AQ_MGPU_CPU_COPY patches (exported from branch mgpu-cpu-copy-0.15.1 by export-patches.sh) and the
+# are the AQ_MGPU_CPU_COPY patches (exported from branch mgpu-cpu-copy-0.16.0 by export-patches.sh) and the
 # marker files below.
 #
 # pkgrel N.M = official pkgrel N + revision M of the patch set. It is higher than the official pkgrel, so a
@@ -8,8 +8,8 @@
 # when that happens.
 
 pkgname=aquamarine
-pkgver=0.15.1
-pkgrel=1.3
+pkgver=0.16.0
+pkgrel=1.1
 pkgdesc='a very light linux rendering backend library (+ AQ_MGPU_CPU_COPY for NVIDIA-render / Intel-scanout)'
 arch=(x86_64 aarch64)
 url="https://github.com/hyprwm/$pkgname"
@@ -37,10 +37,10 @@ source=("$url/archive/v$pkgver/$_archive.tar.gz"
         0001-drm-add-AQ_MGPU_CPU_COPY-a-CPU-copy-path-for-seconda.patch
         0002-drm-AQ_MGPU_CPU_COPY-support-10-bit-X-A-2101010-outp.patch
         0003-drm-AQ_MGPU_CPU_COPY-wait-for-the-GPU-asleep-before-.patch)
-sha256sums=('2f9de98c0bd1b7b1b09c576e390a2fef436449762fb334163c414f0c300296f2'
-            '4a8d1909f2c126a507f7e794341a309cc20d1dd959bfb021cfb3663b8310470c'
-            'b334db3259051448350227cd58dbccc6d7b41e7ff004af8a37077323f9e54f97'
-            'ebab48654656a28131ffd9eab5f3ccda40297e32efe3c369f5a3060aab577ef5')
+sha256sums=('42339c3096c9de6582c0d71bc86b7e63334a3faf6a2b917d385ad093caf66c3c'
+            '5b1bd80944f7333a471d0a3bcbdf513948722cb2168952f612451e72fae09102'
+            '277b9d3b621ec4b2a4c99802688e8d748bcca6a37adc862a6fc5baae74da9af0'
+            '1e2632b32a2c381aa21c955ef460bc6c0389a3e95f478328f6018485782d350d')
 
 prepare() {
 	cd "$_archive"

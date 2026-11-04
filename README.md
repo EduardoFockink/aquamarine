@@ -105,9 +105,11 @@ frame. Reading into a PBO first was measured and is slower (6.9 vs 4.3 ms per fu
 | Branch / tag | Content |
 | --- | --- |
 | `main` | Mirror of upstream `main`. |
+| `mgpu-cpu-copy-0.16.0` | The three commits on top of upstream `v0.16.0` (`libaquamarine.so.15`, needed by Hyprland 0.57.1). Source of the patches in this branch. |
+| `v0.16.0-mgpu-1` | The exact code in package `0.16.0-1.1`. |
 | `mgpu-cpu-copy-0.15.1` | The three commits on top of upstream `v0.15.1`. |
 | `v0.15.1-mgpu-1.3` | The exact code in package `0.15.1-1.3`. |
-| `mgpu-cpu-copy-main` | The same three commits on top of upstream `main` (after #279). Daily-driven since 2026-10-31 as a `0.15.1.r13` build; the base for the next release. |
+| `mgpu-cpu-copy-main` | The same three commits on top of upstream `main` (after #279). Daily-driven from 2026-10-31 as a `0.15.1.r13` build, until `v0.16.0` was released on that same base. |
 | `packaging` | This branch. |
 
 Next step for `mgpu-cpu-copy-main`: reuse the dumb allocator and the CPU-copy fallback that
@@ -130,7 +132,7 @@ package file around: if the session does not come up, switch to a TTY and reinst
 previous package and restarts the display manager unless the new login is confirmed within 90 s, so a
 build that leaves the screen unusable fixes itself.
 
-To refresh the patches after changing a code branch: `./export-patches.sh v0.15.1 mgpu-cpu-copy-0.15.1`,
+To refresh the patches after changing a code branch: `./export-patches.sh v0.16.0 mgpu-cpu-copy-0.16.0`,
 then `updpkgsums`.
 
 ## Tests

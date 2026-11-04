@@ -26,10 +26,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 160 insertions(+), 14 deletions(-)
 
 diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp
-index fc964cf..1838b17 100644
+index a89724c..02511bc 100644
 --- a/src/backend/drm/DRM.cpp
 +++ b/src/backend/drm/DRM.cpp
-@@ -2685,13 +2685,27 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+@@ -2722,13 +2722,27 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
                  return false;
              }
  
@@ -60,7 +60,7 @@ index fc964cf..1838b17 100644
                  default:
                      backend->backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MGPU_CPU_COPY: unsupported format {}", fourccToName(DMA.format)));
                      return false;
-@@ -2709,7 +2723,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+@@ -2746,7 +2760,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
  
              auto OPTIONS   = copy.swapchain->currentOptions();
              OPTIONS.size   = STATE.buffer->size;
@@ -69,7 +69,7 @@ index fc964cf..1838b17 100644
              OPTIONS.length = 2;
              OPTIONS.cursor = false;
              if (const auto& CUR = copy.swapchain->currentOptions(); CUR.size != OPTIONS.size || CUR.format != OPTIONS.format || CUR.length != OPTIONS.length) {
-@@ -2745,7 +2759,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+@@ -2782,7 +2796,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
              const auto [PTR, FMT, LEN] = BUF->beginDataPtr(0);
              const auto STRIDE          = BUF->dmabuf().strides.at(0);
              const bool COPIED          = PTR &&
@@ -79,11 +79,11 @@ index fc964cf..1838b17 100644
              BUF->endDataPtr();
              if (!COPIED) {
 diff --git a/src/backend/drm/Renderer.cpp b/src/backend/drm/Renderer.cpp
-index bb9ea75..1ade79a 100644
+index aa2abd9..b58cc62 100644
 --- a/src/backend/drm/Renderer.cpp
 +++ b/src/backend/drm/Renderer.cpp
-@@ -824,7 +824,117 @@ void CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, st
-     GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+@@ -831,7 +831,117 @@ bool CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, st
+     return true;
  }
  
 -bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstStride, GLenum glFormat, const CRegion& region, int waitFD) {
@@ -201,7 +201,7 @@ index bb9ea75..1ade79a 100644
      if (!from || !dst || dstStride % 4 != 0)
          return false;
  
-@@ -834,14 +944,18 @@ bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstSt
+@@ -841,14 +951,18 @@ bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstSt
      if (waitFD >= 0 && !CFileDescriptor::isReadable(waitFD))
          waitOnSync(waitFD);
  
@@ -224,7 +224,7 @@ index bb9ea75..1ade79a 100644
      // the image's first row is GL's y = 0, so a rect maps 1:1 onto the destination memory
      GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, FBO));
      GLCALL(glPixelStorei(GL_PACK_ALIGNMENT, 4));
-@@ -852,7 +966,7 @@ bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstSt
+@@ -859,7 +973,7 @@ bool CDRMRenderer::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstSt
          const int W = r.x2 - r.x1, H = r.y2 - r.y1;
          if (W <= 0 || H <= 0)
              return;
@@ -234,10 +234,10 @@ index bb9ea75..1ade79a 100644
              backend->log(AQ_LOG_ERROR, std::format("EGL (readRegionInto): glReadPixels failed: 0x{:x}", ERR));
              ok = false;
 diff --git a/src/backend/drm/Renderer.hpp b/src/backend/drm/Renderer.hpp
-index 5124b4d..2ec20bd 100644
+index 8d64b3f..501a81f 100644
 --- a/src/backend/drm/Renderer.hpp
 +++ b/src/backend/drm/Renderer.hpp
-@@ -104,11 +104,18 @@ namespace Aquamarine {
+@@ -112,11 +112,18 @@ namespace Aquamarine {
          SBlitResult blit(Hyprutils::Memory::CSharedPointer<IBuffer> from, Hyprutils::Memory::CSharedPointer<IBuffer> to,
                           Hyprutils::Memory::CSharedPointer<CDRMRenderer> primaryRenderer, int waitFD = -1);
  
@@ -259,7 +259,7 @@ index 5124b4d..2ec20bd 100644
                              int waitFD = -1);
          // can't be a SP<> because we call it from buf's ctor...
          void clearBuffer(IBuffer* buf);
-@@ -171,6 +178,17 @@ namespace Aquamarine {
+@@ -179,6 +186,17 @@ namespace Aquamarine {
  
          EGLImageKHR                                           createEGLImage(const SDMABUFAttrs& attrs);
          GLuint                                                readFramebuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf);
