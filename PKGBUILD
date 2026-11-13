@@ -1,7 +1,7 @@
 # Maintainer: Eduardo Fockink <54868856+EduardoFockink@users.noreply.github.com>
 # Based on the official Arch package (Maintainer: Caleb Maclennan <caleb@alerque.com>); the only differences
-# are the AQ_MGPU_CPU_COPY patches (exported from branch mgpu-cpu-copy-0.16.0 by export-patches.sh) and the
-# marker files below.
+# are the AQ_MGPU_CPU_COPY patches (exported from branch mgpu-cpu-copy-0.16.0 by export-patches.sh), the
+# AQ_MGPU_GPU_COPY patch (0004, from branch mgpu-gpu-copy-0.16.0) and the marker files below.
 #
 # pkgrel N.M = official pkgrel N + revision M of the patch set. It is higher than the official pkgrel, so a
 # routine upgrade keeps this package until a new upstream version lands; aquamarine-mgpu-cpu-copy.hook warns
@@ -9,8 +9,8 @@
 
 pkgname=aquamarine
 pkgver=0.16.0
-pkgrel=1.1
-pkgdesc='a very light linux rendering backend library (+ AQ_MGPU_CPU_COPY for NVIDIA-render / Intel-scanout)'
+pkgrel=1.4
+pkgdesc='a very light linux rendering backend library (+ AQ_MGPU_CPU_COPY / AQ_MGPU_GPU_COPY for NVIDIA-render / Intel-scanout)'
 arch=(x86_64 aarch64)
 url="https://github.com/hyprwm/$pkgname"
 license=(BSD-3-Clause)
@@ -28,19 +28,23 @@ depends=(libgcc
          seatd libseat.so
          systemd-libs libudev.so
          wayland libwayland-client.so
-         wayland-protocols)
+         wayland-protocols
+         vulkan-icd-loader libvulkan.so)
 makedepends=(cmake
-             hyprwayland-scanner)
+             hyprwayland-scanner
+             vulkan-headers)
 provides=("lib$pkgname.so")
 _archive="$pkgname-$pkgver"
 source=("$url/archive/v$pkgver/$_archive.tar.gz"
         0001-drm-add-AQ_MGPU_CPU_COPY-a-CPU-copy-path-for-seconda.patch
         0002-drm-AQ_MGPU_CPU_COPY-support-10-bit-X-A-2101010-outp.patch
-        0003-drm-AQ_MGPU_CPU_COPY-wait-for-the-GPU-asleep-before-.patch)
+        0003-drm-AQ_MGPU_CPU_COPY-wait-for-the-GPU-asleep-before-.patch
+        0004-drm-add-AQ_MGPU_GPU_COPY-a-zero-CPU-copy-path-via-Vul.patch)
 sha256sums=('42339c3096c9de6582c0d71bc86b7e63334a3faf6a2b917d385ad093caf66c3c'
             '5b1bd80944f7333a471d0a3bcbdf513948722cb2168952f612451e72fae09102'
             '277b9d3b621ec4b2a4c99802688e8d748bcca6a37adc862a6fc5baae74da9af0'
-            '1e2632b32a2c381aa21c955ef460bc6c0389a3e95f478328f6018485782d350d')
+            '1e2632b32a2c381aa21c955ef460bc6c0389a3e95f478328f6018485782d350d'
+            'a9e53fafc9a0b128abc8c1bf94472f1aabfc5e5f8a28b7c2c4487ea02b81004d')
 
 prepare() {
 	cd "$_archive"
@@ -71,5 +75,9 @@ https://github.com/EduardoFockink/aquamarine/tree/packaging
 EOF
 	install -Dm0644 /dev/stdin "$pkgdir/usr/share/aquamarine/mgpu-cpu-copy-10bit" <<EOF
 aquamarine $pkgver-$pkgrel: AQ_MGPU_CPU_COPY also copies 10-bit frames (X/A*2101010, HDR).
+EOF
+	install -Dm0644 /dev/stdin "$pkgdir/usr/share/aquamarine/mgpu-gpu-copy" <<EOF
+aquamarine $pkgver-$pkgrel with AQ_MGPU_GPU_COPY (the primary's Vulkan copy engine writes exported linear
+buffers the secondary scans out; 8 and 10 bit; falls back to AQ_MGPU_CPU_COPY).
 EOF
 }

@@ -1,0 +1,80 @@
+# Maintainer: Eduardo Fockink <54868856+EduardoFockink@users.noreply.github.com>
+# Based on the official Arch package (Maintainer: Caleb Maclennan <caleb@alerque.com>); the only differences
+# are the mgpu copy module patch (src/backend/drm/mgpu, from the worktree on branch mgpu-module-main) and the
+# marker files below.
+#
+# SNAPSHOT of upstream main (v0.16.0 + 8 commits, 7c1c55b, 2026-11-13), not a release: it has the fixes
+# merged after 0.16.0 (#477 HDR blob, #478 CRTC recheck, #484 GBM, #485 async test). The release-based
+# package is ../PKGBUILD. pkgver 0.16.0.rN sorts above 0.16.0 and below 0.16.1, so the next official
+# release replaces it (and aquamarine-mgpu-cpu-copy.hook warns).
+#
+
+pkgname=aquamarine
+_commit=7c1c55b2a76ddb9f6602f8c0886ecf1b899529f9
+pkgver=0.16.0.r8.g7c1c55b
+pkgrel=2
+pkgdesc='a very light linux rendering backend library (+ AQ_MGPU_CPU_COPY / AQ_MGPU_GPU_COPY for NVIDIA-render / Intel-scanout)'
+arch=(x86_64 aarch64)
+url="https://github.com/hyprwm/$pkgname"
+license=(BSD-3-Clause)
+depends=(libgcc
+         libstdc++
+         glibc # libc.so libm.so
+         hyprutils libhyprutils.so
+         libdisplay-info libdisplay-info.so
+         libdrm # libdrm.so
+         libglvnd libEGL.so
+         libinput # libinput.so
+         mesa # libgbm.so
+         opengl-driver
+         pixman
+         seatd libseat.so
+         systemd-libs libudev.so
+         wayland libwayland-client.so
+         wayland-protocols
+         vulkan-icd-loader libvulkan.so)
+makedepends=(cmake
+             hyprwayland-scanner
+             vulkan-headers)
+provides=("lib$pkgname.so")
+_archive="$pkgname-$_commit"
+source=("$_archive.tar.gz::$url/archive/$_commit.tar.gz"
+        0001-drm-mgpu-copy-module-AQ_MGPU_GPU_COPY-AQ_MGPU_CPU_COPY.patch)
+sha256sums=('b031e95d8249266549f7e93257e9010c9c4d4674924fafa31b4bfd3eda7930cf'
+            'c30a5272c3e9ca40bd188bcede721bace0b3c79d9eb53ed3e5789012e73d0ad4')
+
+prepare() {
+	cd "$_archive"
+	local p
+	for p in "${source[@]:1}"; do
+		patch -Np1 -i "../$p"
+	done
+}
+
+build() {
+	cd "$_archive"
+	cmake -B build \
+		-D CMAKE_INSTALL_PREFIX=/usr \
+		-D CMAKE_BUILD_TYPE=Release
+	cmake --build build
+}
+
+package() {
+	cd "$_archive"
+	DESTDIR="$pkgdir" cmake --install build
+	install -Dm0644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE
+
+	# Markers a compositor config can test before enabling the mode: with the official package the
+	# NVIDIA->Intel copy aborts in Mesa, so a missing marker should mean "fall back, don't loop the login".
+	install -Dm0644 /dev/stdin "$pkgdir/usr/share/aquamarine/mgpu-cpu-copy" <<EOF
+aquamarine $pkgver-$pkgrel with AQ_MGPU_CPU_COPY (copies 8-bit frames).
+https://github.com/EduardoFockink/aquamarine/tree/packaging
+EOF
+	install -Dm0644 /dev/stdin "$pkgdir/usr/share/aquamarine/mgpu-cpu-copy-10bit" <<EOF
+aquamarine $pkgver-$pkgrel: AQ_MGPU_CPU_COPY also copies 10-bit frames (X/A*2101010, HDR).
+EOF
+	install -Dm0644 /dev/stdin "$pkgdir/usr/share/aquamarine/mgpu-gpu-copy" <<EOF
+aquamarine $pkgver-$pkgrel with AQ_MGPU_GPU_COPY (the primary's Vulkan copy engine writes exported linear
+buffers the secondary scans out; 8 and 10 bit; falls back to AQ_MGPU_CPU_COPY).
+EOF
+}

@@ -1,0 +1,1903 @@
+From: Eduardo Fockink <54868856+EduardoFockink@users.noreply.github.com>
+Subject: [PATCH] drm: mgpu copy module (AQ_MGPU_GPU_COPY, AQ_MGPU_CPU_COPY) for NVIDIA-render / Intel-scanout
+
+For an output on a secondary GPU, the primary copies each frame's damaged region into a linear buffer the
+secondary only scans out, instead of the secondary importing the primary's buffer (an NVIDIA primary cannot
+render into LINEAR and Mesa cannot read NVIDIA's native layout).
+
+  AQ_MGPU_GPU_COPY  the primary's Vulkan copy engine writes a buffer it exported; KMS waits on the copy's fence
+  AQ_MGPU_CPU_COPY  the primary reads the region back into a dumb buffer of the secondary (also the fallback)
+
+Everything lives in src/backend/drm/mgpu. Upstream files only carry hooks (36 lines): DRM.cpp, GBM.cpp, one
+friend declaration in CDRMOutput, CDRMBackend and CDRMRenderer, and the vulkan dependency. The same patch applies
+to v0.16.0 and to main.
+
+Replaces the earlier four patches (0001-0003 CPU copy inside DRM.cpp/Renderer.cpp, 0004 GPU copy). New: one
+damage journal for both engines, per-output fallback with a retry after a growing pause, counters in the trace,
+and AQ_MGPU_GPU_COPY_VERIFY=<n> (compare samples of the scanout buffer with the rendered frame).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8558e2e..3175643 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -36,7 +36,8 @@ pkg_check_modules(
+   gbm
+   libudev
+   libdisplay-info
+-  hwdata)
++  hwdata
++  vulkan)
+ 
+ configure_file(aquamarine.pc.in aquamarine.pc @ONLY)
+ 
+diff --git a/include/aquamarine/backend/DRM.hpp b/include/aquamarine/backend/DRM.hpp
+index 25e27da..6206381 100644
+--- a/include/aquamarine/backend/DRM.hpp
++++ b/include/aquamarine/backend/DRM.hpp
+@@ -288,6 +288,7 @@ namespace Aquamarine {
+         friend struct SDRMConnector;
+         friend class CDRMLease;
+         friend class CDRMBackend;
++        friend class CMgpuCopy;
+     };
+ 
+     struct SDRMConnectorCommitData {
+@@ -579,5 +580,6 @@ namespace Aquamarine {
+         friend class CDRMAtomicRequest;
+         friend class CDRMLease;
+         friend class CGBMBuffer;
++        friend class CMgpuCopy;
+     };
+ };
+diff --git a/src/allocator/GBM.cpp b/src/allocator/GBM.cpp
+index 72e7d45..52dbcc1 100644
+--- a/src/allocator/GBM.cpp
++++ b/src/allocator/GBM.cpp
+@@ -159,6 +159,15 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
+         explicitModifiers = {DRM_FORMAT_MOD_LINEAR};
+     }
+ 
++    // AQ_MGPU_CPU_COPY / AQ_MGPU_GPU_COPY (src/backend/drm/mgpu): the secondary GPU never imports this buffer, the
++    // primary copies it itself, so don't restrict it to layouts the secondary understands (often just LINEAR, which
++    // Nvidia can't render into).
++    static const bool MGPU_COPY = envEnabled("AQ_MGPU_CPU_COPY") || envEnabled("AQ_MGPU_GPU_COPY");
++    if (MULTIGPU && MGPU_COPY) {
++        allocator->backend->log(AQ_LOG_DEBUG, "GBM: Buffer is marked as multigpu, mgpu copy: using the primary's native layout");
++        explicitModifiers.clear();
++    }
++
+     uint32_t flags = GBM_BO_USE_RENDERING;
+     if (params.scanout && !MULTIGPU)
+         flags |= GBM_BO_USE_SCANOUT;
+@@ -168,6 +177,9 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
+     if (explicitModifiers.empty()) {
+         allocator->backend->log(AQ_LOG_WARNING, "GBM: Using modifier-less allocation");
+         bo = gbm_bo_create(allocator->gbmDevice, attrs.size.x, attrs.size.y, attrs.format, flags);
++        // the primary reads this buffer back through EGL (or imports it into Vulkan), which needs its real layout
++        if (bo && MULTIGPU && MGPU_COPY)
++            modifier = gbm_bo_get_modifier(bo);
+     } else {
+         TRACE(allocator->backend->log(AQ_LOG_TRACE, std::format("GBM: Using modifier-based allocation, modifiers: {}", explicitModifiers.size())));
+         for (auto const& mod : explicitModifiers) {
+diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp
+index e2e9b7c..14aad57 100644
+--- a/src/backend/drm/DRM.cpp
++++ b/src/backend/drm/DRM.cpp
+@@ -40,6 +40,7 @@ extern "C" {
+ #include "Renderer.hpp"
+ #include "OutputTiming.hpp"
+ #include "AsyncCommit.hpp"
++#include "mgpu/MgpuCopy.hpp"
+ 
+ #include <hyprutils/utils/ScopeGuard.hpp>
+ using Hyprutils::Utils::CScopeGuard;
+@@ -2340,11 +2341,13 @@ Aquamarine::CDRMOutput::~CDRMOutput() {
+         backend->backend->removeIdleEvent(frameIdle);
+     connector->sched.onFrameComplete();
+     connector->sched.setFrameScheduled(false);
++    CMgpuCopy::forget(this);
+ }
+ 
+ void Aquamarine::CDRMOutput::releaseMgpuResources() {
+     mgpu.swapchain.reset();
+     mgpu.cursorSwapchain.reset();
++    CMgpuCopy::forget(this);
+ 
+     if (swapchain) {
+         auto options   = swapchain->currentOptions();
+@@ -2397,6 +2400,12 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
+ 
+     SP<CDRMFB> drmFB;
+     if (backend->shouldBlit()) {
++        // the mgpu copy only runs in commitState(): send these commits down the synchronous path
++        if (CMgpuCopy::enabled()) {
++            requiresSync = true;
++            return false;
++        }
++
+         if (!backend->rendererState.renderer) {
+             backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for asynchronous blitting, initializing");
+             if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
+@@ -2676,8 +2685,17 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+ 
+         SP<CDRMFB> drmFB;
+ 
++        // AQ_MGPU_GPU_COPY / AQ_MGPU_CPU_COPY (mgpu/MgpuCopy.hpp): the primary copies the frame into a linear buffer
++        auto mgpuCopied = CMgpuCopy::eResult::NOT_HANDLED;
++        if (!blittedFB && backend->shouldBlit())
++            mgpuCopied = CMgpuCopy::copyFrame(this, data, onlyTest, drmFB);
++        if (mgpuCopied == CMgpuCopy::eResult::FAILED)
++            return false;
++
+         if (blittedFB)
+             drmFB = blittedFB;
++        else if (mgpuCopied == CMgpuCopy::eResult::COPIED)
++            ; // drmFB and the in-fence are set
+         else if (backend->shouldBlit()) {
+             if (!backend->rendererState.renderer) {
+                 backend->backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for blitting, initializing");
+@@ -2834,6 +2852,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+         data.ctm = STATE.ctm;
+ 
+     bool ok = connector->commitState(data);
++    CMgpuCopy::commitResult(this, ok, onlyTest);
+ 
+     // a buffer acquired only to validate/attempt the modeset isn't consumed by the
+     // consumer: rewind the swapchain so the acquire cursor stays in sync with it.
+diff --git a/src/backend/drm/Renderer.hpp b/src/backend/drm/Renderer.hpp
+index 89a01c7..6819053 100644
+--- a/src/backend/drm/Renderer.hpp
++++ b/src/backend/drm/Renderer.hpp
+@@ -190,5 +190,6 @@ namespace Aquamarine {
+         friend class CEglContextGuard;
+         friend class CDRMRendererBufferInputAttachment;
+         friend class CDRMRendererBufferOutputAttachment;
++        friend class CMgpuCpuReader;
+     };
+ };
+diff --git a/src/backend/drm/mgpu/CpuCopy.cpp b/src/backend/drm/mgpu/CpuCopy.cpp
+new file mode 100644
+index 0000000..6bda38a
+--- /dev/null
++++ b/src/backend/drm/mgpu/CpuCopy.cpp
+@@ -0,0 +1,304 @@
++#include "CpuCopy.hpp"
++#include "../Renderer.hpp"
++#include "Shared.hpp"
++#include <hyprutils/os/FileDescriptor.hpp>
++#include <cerrno>
++#include <format>
++#include <poll.h>
++#include <string>
++#include <unistd.h>
++
++using namespace Aquamarine;
++using namespace Hyprutils::Memory;
++using namespace Hyprutils::Math;
++using namespace Hyprutils::OS;
++#define SP CSharedPointer
++
++static GLuint compileShader(GLenum type, const std::string& src) {
++    const GLuint shader = glCreateShader(type);
++    const char*  ptr    = src.c_str();
++    glShaderSource(shader, 1, &ptr, nullptr);
++    glCompileShader(shader);
++    GLint ok = GL_FALSE;
++    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++    if (ok == GL_FALSE) {
++        glDeleteShader(shader);
++        return 0;
++    }
++    return shader;
++}
++
++static GLuint createProgram(const std::string& vert, const std::string& frag) {
++    const GLuint v = compileShader(GL_VERTEX_SHADER, vert);
++    const GLuint f = v ? compileShader(GL_FRAGMENT_SHADER, frag) : 0;
++    if (!v || !f) {
++        if (v)
++            glDeleteShader(v);
++        return 0;
++    }
++    const GLuint prog = glCreateProgram();
++    glAttachShader(prog, v);
++    glAttachShader(prog, f);
++    glLinkProgram(prog);
++    glDetachShader(prog, v);
++    glDetachShader(prog, f);
++    glDeleteShader(v);
++    glDeleteShader(f);
++    GLint ok = GL_FALSE;
++    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
++    if (ok == GL_FALSE) {
++        glDeleteProgram(prog);
++        return 0;
++    }
++    return prog;
++}
++
++static const std::string VERT_SRC_PACK = R"#(#version 300 es
++void main() {
++    // one triangle over the whole viewport: the scissor picks the rect
++    vec2 pos = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
++    gl_Position = vec4(pos, 0.0, 1.0);
++})#";
++
++static std::string packFragSrc(bool external) {
++    return std::string("#version 300 es\n") + (external ? "#extension GL_OES_EGL_image_external_essl3 : require\n" : "") + R"#(
++precision highp float;
++precision highp int;
++
++uniform highp )#" + (external ? "samplerExternalOES" : "sampler2D") + R"#( tex;
++uniform vec2 invSize;
++uniform int swapRB;
++out vec4 fragColor;
++
++void main() {
++    // the image's first row is GL's y = 0 both in tex and in the target: no flip
++    vec3  c = texture(tex, gl_FragCoord.xy * invSize).rgb;
++    uvec3 v = uvec3(round(clamp(c, 0.0, 1.0) * 1023.0));
++    if (swapRB == 1)
++        v = v.bgr;
++    // the X*2101010 word, split into its 4 bytes (lowest first) so an RGBA8 readback stores it as is
++    uint w = v.r | (v.g << 10u) | (v.b << 20u) | (3u << 30u);
++    fragColor = vec4(uvec4(w, w >> 8u, w >> 16u, w >> 24u) & 255u) / 255.0;
++})#";
++}
++
++bool Aquamarine::CMgpuCpuReader::layoutFor(uint32_t drmFormat, eLayout& layout) {
++    switch (drmFormat) {
++        case DRM_FORMAT_XRGB8888:
++        case DRM_FORMAT_ARGB8888: layout = eLayout::BGRA8; return true;
++        case DRM_FORMAT_XBGR8888:
++        case DRM_FORMAT_ABGR8888: layout = eLayout::RGBA8; return true;
++        case DRM_FORMAT_XBGR2101010:
++        case DRM_FORMAT_ABGR2101010: layout = eLayout::XBGR2101010; return true;
++        case DRM_FORMAT_XRGB2101010:
++        case DRM_FORMAT_ARGB2101010: layout = eLayout::XRGB2101010; return true;
++        default: return false;
++    }
++}
++
++Aquamarine::CMgpuCpuReader::CMgpuCpuReader(SP<CDRMRenderer> renderer_) : renderer(renderer_) {
++    ;
++}
++
++// Returns an FBO (cached in buf's output attachment, the one upstream's readBuffer() also uses) to read buf from,
++// or 0 on failure. Needs a current context.
++GLuint Aquamarine::CMgpuCpuReader::readFramebuffer(SP<CDRMRenderer> r, SP<IBuffer> buf) {
++    auto att = buf->attachments.get<CDRMRendererBufferOutputAttachment>();
++    if (!att || att->renderer != r->self) {
++        att = makeShared<CDRMRendererBufferOutputAttachment>(r->self, nullptr, 0, 0);
++        buf->attachments.add(att);
++    }
++
++    if (!att->eglImage) {
++        att->eglImage = r->createEGLImage(buf->dmabuf());
++        if (att->eglImage == EGL_NO_IMAGE_KHR) {
++            r->backend->log(AQ_LOG_ERROR, std::format("mgpu (readFramebuffer): createEGLImage failed: {}", eglGetError()));
++            return 0;
++        }
++
++        glGenRenderbuffers(1, &att->rbo);
++        glBindRenderbuffer(GL_RENDERBUFFER, att->rbo);
++        r->proc.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, (GLeglImageOES)att->eglImage);
++        glBindRenderbuffer(GL_RENDERBUFFER, 0);
++
++        glGenFramebuffers(1, &att->fbo);
++        glBindFramebuffer(GL_FRAMEBUFFER, att->fbo);
++        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, att->rbo);
++
++        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++            r->backend->log(AQ_LOG_ERROR, std::format("mgpu (readFramebuffer): glCheckFramebufferStatus failed: {}", glGetError()));
++            glBindFramebuffer(GL_FRAMEBUFFER, 0);
++            buf->attachments.remove(att);
++            return 0;
++        }
++    }
++
++    return att->fbo;
++}
++
++// Repacks `region` of the 10 bit buffer `from` into pack's RGBA8 FBO (see CpuCopy.hpp) and returns that FBO, or 0 on
++// failure. Needs a current context.
++GLuint Aquamarine::CMgpuCpuReader::packFramebuffer(SP<CDRMRenderer> r, SP<IBuffer> from, const CRegion& region, bool swapRB) {
++    // `from`'s texture, cached like blit() does
++    auto att = from->attachments.get<CDRMRendererBufferInputAttachment>();
++    if (!att || att->renderer != r->self) {
++        att = makeShared<CDRMRendererBufferInputAttachment>(r->self, r->glTex(from), std::vector<uint8_t>());
++        from->attachments.add(att);
++    }
++    if (!att->tex || !att->tex->image || !att->tex->texid) {
++        r->backend->log(AQ_LOG_ERROR, "mgpu (packFramebuffer): no texture for the source buffer");
++        return 0;
++    }
++
++    const int  I    = att->tex->target == GL_TEXTURE_EXTERNAL_OES ? 1 : 0;
++    const auto SIZE = from->dmabuf().size;
++
++    if (!pack.program[I]) {
++        pack.program[I] = createProgram(VERT_SRC_PACK, packFragSrc(I == 1));
++        if (!pack.program[I]) {
++            r->backend->log(AQ_LOG_ERROR, "mgpu (packFramebuffer): 10 bit pack shader failed");
++            return 0;
++        }
++        pack.tex[I]     = glGetUniformLocation(pack.program[I], "tex");
++        pack.invSize[I] = glGetUniformLocation(pack.program[I], "invSize");
++        pack.swapRB[I]  = glGetUniformLocation(pack.program[I], "swapRB");
++    }
++
++    if (!pack.vao)
++        glGenVertexArrays(1, &pack.vao);
++
++    if (!pack.fbo || pack.size != SIZE) {
++        if (!pack.rbo)
++            glGenRenderbuffers(1, &pack.rbo);
++        if (!pack.fbo)
++            glGenFramebuffers(1, &pack.fbo);
++
++        glBindRenderbuffer(GL_RENDERBUFFER, pack.rbo);
++        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, SIZE.x, SIZE.y);
++        glBindRenderbuffer(GL_RENDERBUFFER, 0);
++        glBindFramebuffer(GL_FRAMEBUFFER, pack.fbo);
++        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, pack.rbo);
++
++        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++            r->backend->log(AQ_LOG_ERROR, std::format("mgpu (packFramebuffer): glCheckFramebufferStatus failed: {}", glGetError()));
++            pack.size = {};
++            return 0;
++        }
++        pack.size = SIZE;
++        r->backend->log(AQ_LOG_DEBUG, std::format("mgpu (packFramebuffer): 10 bit pack target is {}x{}", SIZE.x, SIZE.y));
++    }
++
++    glBindFramebuffer(GL_FRAMEBUFFER, pack.fbo);
++    glViewport(0, 0, SIZE.x, SIZE.y);
++    glDisable(GL_BLEND);
++    r->useProgram(pack.program[I]);
++
++    glActiveTexture(GL_TEXTURE0);
++    att->tex->bind();
++    att->tex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    att->tex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glUniform1i(pack.tex[I], 0);
++    glUniform2f(pack.invSize[I], 1.F / SIZE.x, 1.F / SIZE.y);
++    glUniform1i(pack.swapRB[I], swapRB ? 1 : 0);
++    glBindVertexArray(pack.vao);
++
++    glEnable(GL_SCISSOR_TEST);
++    region.forEachRect([&](const pixman_box32_t& rect) {
++        if (rect.x2 <= rect.x1 || rect.y2 <= rect.y1)
++            return;
++        glScissor(rect.x1, rect.y1, rect.x2 - rect.x1, rect.y2 - rect.y1);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++    });
++    glDisable(GL_SCISSOR_TEST);
++
++    glBindVertexArray(0);
++    att->tex->unbind();
++    return pack.fbo;
++}
++
++int Aquamarine::CMgpuCpuReader::createNativeFenceFD() {
++    const auto r = renderer.lock();
++    if (!r)
++        return -1;
++    CEglContextGuard eglContext(*r);
++    EGLSyncKHR       sync = r->proc.eglCreateSyncKHR(r->egl.display, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
++    if (sync == EGL_NO_SYNC_KHR)
++        return -1;
++    glFlush(); // otherwise the fd may not be valid yet
++    const int fd = r->proc.eglDupNativeFenceFDANDROID(r->egl.display, sync);
++    r->proc.eglDestroySyncKHR(r->egl.display, sync);
++    return fd == EGL_NO_NATIVE_FENCE_FD_ANDROID ? -1 : fd;
++}
++
++void Aquamarine::CMgpuCpuReader::waitForGpuAsleep(SP<CDRMRenderer> r) {
++    EGLSyncKHR sync = r->proc.eglCreateSyncKHR(r->egl.display, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
++    if (sync == EGL_NO_SYNC_KHR) {
++        TRACE(r->backend->log(AQ_LOG_TRACE, "mgpu (waitForGpuAsleep): failed to create a native fence"));
++        return;
++    }
++
++    // we need to flush otherwise we might not get a valid fd
++    glFlush();
++
++    const int fd = r->proc.eglDupNativeFenceFDANDROID(r->egl.display, sync);
++    if (r->proc.eglDestroySyncKHR(r->egl.display, sync) != EGL_TRUE)
++        TRACE(r->backend->log(AQ_LOG_TRACE, "mgpu (waitForGpuAsleep): failed to destroy sync"));
++    if (fd == EGL_NO_NATIVE_FENCE_FD_ANDROID) {
++        TRACE(r->backend->log(AQ_LOG_TRACE, "mgpu (waitForGpuAsleep): failed to dup the fence fd"));
++        return;
++    }
++
++    pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
++    while (poll(&pfd, 1, 1000) < 0 && errno == EINTR) {
++        ;
++    }
++    close(fd);
++}
++
++bool Aquamarine::CMgpuCpuReader::readRegionInto(SP<IBuffer> from, uint8_t* dst, uint32_t dstStride, eLayout layout, const CRegion& region, int waitFD) {
++    const auto r = renderer.lock();
++    if (!r || !from || !dst || dstStride % 4 != 0)
++        return false;
++
++    CEglContextGuard eglContext(*r);
++
++    // the client may still be rendering into `from`
++    if (waitFD >= 0 && !CFileDescriptor::isReadable(waitFD))
++        r->waitOnSync(waitFD);
++
++    const auto SIZE    = from->dmabuf().size;
++    CRegion    clipped = region.copy(); // intersect() returns a reference: keep the copy alive
++    clipped.intersect(0, 0, SIZE.x, SIZE.y);
++
++    const auto FBO = isPacked(layout) ? packFramebuffer(r, from, clipped, layout == eLayout::XRGB2101010) : readFramebuffer(r, from);
++    if (!FBO)
++        return false;
++
++    // packed pixels are already the final bytes in R, G, B, A order
++    const GLenum GLFORMAT = layout == eLayout::BGRA8 ? GL_BGRA_EXT : GL_RGBA;
++
++    // the image's first row is GL's y = 0, so a rect maps 1:1 onto the destination memory
++    glBindFramebuffer(GL_FRAMEBUFFER, FBO);
++    glPixelStorei(GL_PACK_ALIGNMENT, 4);
++    glPixelStorei(GL_PACK_ROW_LENGTH, dstStride / 4);
++
++    static const bool SPIN = envEnabled("AQ_MGPU_CPU_COPY_SPIN"); // debug: let glReadPixels do the waiting
++    if (!SPIN)
++        waitForGpuAsleep(r);
++
++    bool ok = true;
++    clipped.forEachRect([&](const pixman_box32_t& rect) {
++        const int W = rect.x2 - rect.x1, H = rect.y2 - rect.y1;
++        if (W <= 0 || H <= 0)
++            return;
++        glReadPixels(rect.x1, rect.y1, W, H, GLFORMAT, GL_UNSIGNED_BYTE, dst + (size_t)rect.y1 * dstStride + (size_t)rect.x1 * 4);
++        if (const auto ERR = glGetError(); ERR != GL_NO_ERROR) {
++            r->backend->log(AQ_LOG_ERROR, std::format("mgpu (readRegionInto): glReadPixels failed: 0x{:x}", ERR));
++            ok = false;
++        }
++    });
++
++    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    return ok;
++}
+diff --git a/src/backend/drm/mgpu/CpuCopy.hpp b/src/backend/drm/mgpu/CpuCopy.hpp
+new file mode 100644
+index 0000000..d2a6766
+--- /dev/null
++++ b/src/backend/drm/mgpu/CpuCopy.hpp
+@@ -0,0 +1,72 @@
++#pragma once
++
++// AQ_MGPU_CPU_COPY's engine: the primary GPU reads a region of its own frame straight into CPU memory (a linear
++// dumb buffer of the secondary GPU, which only scans it out). Also used to read samples of a frame back for
++// AQ_MGPU_GPU_COPY_VERIFY. It works inside the primary's CDRMRenderer context (it is a friend of that class) but
++// keeps all of its own GL state here, so upstream's Renderer.cpp stays untouched.
++
++#include <aquamarine/buffer/Buffer.hpp>
++#include <hyprutils/math/Region.hpp>
++#include <hyprutils/math/Vector2D.hpp>
++#include <hyprutils/memory/SharedPtr.hpp>
++#include <hyprutils/memory/WeakPtr.hpp>
++#include <GLES3/gl3.h>
++#include <cstdint>
++
++namespace Aquamarine {
++    class CDRMRenderer;
++
++    class CMgpuCpuReader {
++      public:
++        // Memory layout readRegionInto writes, 4 bytes per pixel
++        enum class eLayout : uint8_t {
++            BGRA8,       // [AX]RGB8888
++            RGBA8,       // [AX]BGR8888
++            XBGR2101010, // [AX]BGR2101010 (alpha bits set)
++            XRGB2101010, // [AX]RGB2101010 (alpha bits set)
++        };
++
++        // false if the format has no layout here
++        static bool layoutFor(uint32_t drmFormat, eLayout& layout);
++        static bool isPacked(eLayout layout) {
++            return layout == eLayout::XBGR2101010 || layout == eLayout::XRGB2101010;
++        }
++
++        explicit CMgpuCpuReader(Hyprutils::Memory::CSharedPointer<CDRMRenderer> renderer);
++
++        bool usesRenderer(const Hyprutils::Memory::CSharedPointer<CDRMRenderer>& r) const {
++            return renderer.lock() == r;
++        }
++
++        // Reads only `region` of `from` (a buffer the renderer can import) into CPU memory at `dst`, laid out as
++        // `layout` with `dstStride` bytes per row. Synchronous: when it returns, the pixels are in `dst`.
++        bool readRegionInto(Hyprutils::Memory::CSharedPointer<IBuffer> from, uint8_t* dst, uint32_t dstStride, eLayout layout, const Hyprutils::Math::CRegion& region,
++                            int waitFD = -1);
++
++        // A sync_file signalled when the work submitted so far in the renderer's context is done, or -1
++        int createNativeFenceFD();
++
++      private:
++        GLuint readFramebuffer(Hyprutils::Memory::CSharedPointer<CDRMRenderer> r, Hyprutils::Memory::CSharedPointer<IBuffer> buf);
++        GLuint packFramebuffer(Hyprutils::Memory::CSharedPointer<CDRMRenderer> r, Hyprutils::Memory::CSharedPointer<IBuffer> from, const Hyprutils::Math::CRegion& region,
++                               bool swapRB);
++
++        // Blocks until the GPU has finished everything submitted on the context, asleep in the kernel on a native
++        // fence. The NVIDIA driver instead busy-waits inside glReadPixels: with video on a 5K output that wait
++        // burned most of the compositor's ~60% CPU (measured 2026-10-31). If no fence can be made it returns at
++        // once and glReadPixels waits as before.
++        void waitForGpuAsleep(Hyprutils::Memory::CSharedPointer<CDRMRenderer> r);
++
++        Hyprutils::Memory::CWeakPointer<CDRMRenderer> renderer;
++
++        // 10 bit: the driver can't read 2101010 into CPU memory quickly (NVIDIA converts in software, ~330 ms for
++        // 5120x2160), so a shader first repacks each pixel's 32-bit word into an RGBA8 renderbuffer, which reads
++        // back on the fast 8 bit path. Created on first use.
++        struct {
++            GLuint                    program[2] = {0, 0}; // GL_TEXTURE_2D, GL_TEXTURE_EXTERNAL_OES
++            GLint                     tex[2] = {-1, -1}, invSize[2] = {-1, -1}, swapRB[2] = {-1, -1};
++            GLuint                    vao = 0, fbo = 0, rbo = 0;
++            Hyprutils::Math::Vector2D size;
++        } pack;
++    };
++}
+diff --git a/src/backend/drm/mgpu/MgpuCopy.cpp b/src/backend/drm/mgpu/MgpuCopy.cpp
+new file mode 100644
+index 0000000..47261c3
+--- /dev/null
++++ b/src/backend/drm/mgpu/MgpuCopy.cpp
+@@ -0,0 +1,525 @@
++#include "MgpuCopy.hpp"
++#include "CpuCopy.hpp"
++#include "VkCopy.hpp"
++#include "../Renderer.hpp"
++#include "FormatUtils.hpp"
++#include "Shared.hpp"
++#include <aquamarine/allocator/DRMDumb.hpp>
++#include <aquamarine/allocator/Swapchain.hpp>
++#include <aquamarine/backend/Backend.hpp>
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <format>
++#include <poll.h>
++#include <random>
++#include <unistd.h>
++#include <unordered_map>
++#include <vector>
++
++using namespace Aquamarine;
++using namespace Hyprutils::Memory;
++using namespace Hyprutils::Math;
++#define SP CSharedPointer
++#define WP CWeakPointer
++
++using steady = std::chrono::steady_clock;
++
++namespace {
++    constexpr size_t BUFFERS = 2; // scanout buffers per output; the display flips between them
++
++    // The swapchain rotates, so the buffer we get was last written BUFFERS frames ago. This remembers the damage of
++    // the frames in between, to bring it up to date by copying as little as possible.
++    struct SDamageJournal {
++        std::deque<CRegion> damage; // newest first, one entry per written frame
++        size_t              written = 0;
++
++        CRegion outdated(const CRegion& now, const CRegion& full) const {
++            if (written < BUFFERS)
++                return full.copy();
++            CRegion region = now.copy();
++            for (size_t i = 0; i + 1 < BUFFERS && i < damage.size(); ++i)
++                region.add(damage[i]);
++            return region;
++        }
++
++        void wrote(CRegion&& now) {
++            damage.push_front(std::move(now));
++            while (damage.size() > BUFFERS)
++                damage.pop_back();
++            ++written;
++        }
++
++        void reset() {
++            damage.clear();
++            written = 0;
++        }
++    };
++
++    // the linear buffers one engine writes for one output
++    struct STarget {
++        SP<IAllocator> allocator;
++        SP<CSwapchain> swapchain;
++        SDamageJournal journal;
++
++        SP<IBuffer> next(const Vector2D& size, uint32_t format) {
++            auto OPTIONS   = swapchain->currentOptions();
++            OPTIONS.size   = size;
++            OPTIONS.format = format;
++            OPTIONS.length = BUFFERS;
++            OPTIONS.cursor = false;
++            if (const auto& CUR = swapchain->currentOptions(); CUR.size != OPTIONS.size || CUR.format != OPTIONS.format || CUR.length != OPTIONS.length) {
++                journal.reset();
++                if (!swapchain->reconfigure(OPTIONS))
++                    return nullptr;
++            }
++            return swapchain->next(nullptr);
++        }
++    };
++
++    struct SStats {
++        uint64_t gpuFrames = 0, cpuFrames = 0, gpuFailures = 0, lateFences = 0, verifyOk = 0, verifyBad = 0;
++        double   copyCpuMs = 0, copyCpuMaxMs = 0; // CPU time inside CMgpuVkCopy::copy()
++        double   gpuMs = 0;                       // submit -> fence, on the frames that wait on the CPU
++        uint64_t gpuMsSamples = 0;
++    };
++    SStats& stats() {
++        static SStats s;
++        return s;
++    }
++
++    bool gpuEnabled() {
++        static const bool ENABLED = envEnabled("AQ_MGPU_GPU_COPY");
++        return ENABLED;
++    }
++    bool cpuEnabled() {
++        static const bool ENABLED = envEnabled("AQ_MGPU_CPU_COPY");
++        return ENABLED;
++    }
++    // every n-th GPU-copied frame is checked; 0 = never
++    uint64_t verifyEvery() {
++        static const uint64_t N = [] {
++            const char* env = getenv("AQ_MGPU_GPU_COPY_VERIFY");
++            return env ? (uint64_t)std::max(0L, atol(env)) : 0UL;
++        }();
++        return N;
++    }
++
++    double threadCpuMs() {
++        timespec t;
++        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
++        return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
++    }
++
++    // sleeps until the sync_file signals (or `ms` pass); true if it signalled
++    bool waitFence(int fd, int ms) {
++        pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
++        int    ret;
++        while ((ret = poll(&pfd, 1, ms)) < 0 && errno == EINTR) {
++            ;
++        }
++        return ret > 0;
++    }
++
++    // Never destroyed on purpose: compositors keep the backend in a global, so outputs can be destroyed during
++    // exit() after this library's statics are already gone (a plain static map crashed Hyprland on exit).
++    SP<CMgpuVkCopy>& vkCopier() {
++        static auto* copier = new SP<CMgpuVkCopy>();
++        return *copier;
++    }
++    SP<CMgpuCpuReader>& cpuReader() {
++        static auto* reader = new SP<CMgpuCpuReader>();
++        return *reader;
++    }
++}
++
++struct Aquamarine::SMgpuOutput {
++    STarget            gpu, cpu;
++    int                lastFence        = -1;    // the GPU copy's fence handed to KMS last frame; closed on the next one
++    bool               gpuCommitPending = false; // this commit's framebuffer came from the GPU copy
++    bool               gpuOff           = false; // the GPU copy failed here: CPU copy until gpuRetryAt
++    uint32_t           gpuFailures      = 0;
++    steady::time_point gpuRetryAt;
++    uint64_t           gpuFrames = 0;
++
++    ~SMgpuOutput() {
++        if (lastFence >= 0)
++            close(lastFence);
++    }
++};
++
++static std::unordered_map<const CDRMOutput*, SMgpuOutput>& outputs() {
++    static auto* map = new std::unordered_map<const CDRMOutput*, SMgpuOutput>(); // never destroyed, see vkCopier()
++    return *map;
++}
++
++SMgpuVerifyResult Aquamarine::mgpuVerifySamples(SP<CMgpuCpuReader> reader, SP<IBuffer> src, SP<CVkLinearBuffer> lin, const CRegion& copied, uint32_t seed) {
++    constexpr int           BLOCK = 64, IN_COPIED = 12, ANYWHERE = 4;
++    SMgpuVerifyResult       res;
++    CMgpuCpuReader::eLayout layout;
++    const uint8_t*          got = lin ? lin->map() : nullptr;
++    if (!reader || !src || !got || !CMgpuCpuReader::layoutFor(src->dmabuf().format, layout))
++        return res;
++
++    const int W = lin->size.x, H = lin->size.y;
++    // where the samples of the rendered frame are read back, at their own offsets; only those pages are ever touched
++    uint8_t* const want = (uint8_t*)calloc(1, (size_t)lin->stride * H);
++    if (!want)
++        return res;
++
++    std::minstd_rand            rng(seed * 2654435761u + 12345u);
++    std::vector<pixman_box32_t> blocks;
++    CRegion                     sample;
++    auto                        pick = [&](int x1, int y1, int x2, int y2) {
++        x1 = std::clamp(x1, 0, W), x2 = std::clamp(x2, 0, W), y1 = std::clamp(y1, 0, H), y2 = std::clamp(y2, 0, H);
++        if (x2 <= x1 || y2 <= y1)
++            return;
++        const int BW = std::min(BLOCK, x2 - x1), BH = std::min(BLOCK, y2 - y1);
++        const int X = x1 + (int)(rng() % (uint32_t)(x2 - x1 - BW + 1)), Y = y1 + (int)(rng() % (uint32_t)(y2 - y1 - BH + 1));
++        blocks.push_back({X, Y, X + BW, Y + BH});
++        sample.add(X, Y, BW, BH);
++    };
++    const auto RECTS = copied.getRects();
++    for (int i = 0; i < IN_COPIED && !RECTS.empty(); ++i) {
++        const auto& r = RECTS[rng() % RECTS.size()];
++        pick(r.x1, r.y1, r.x2, r.y2);
++    }
++    const size_t FIRST_ANYWHERE = blocks.size();
++    for (int i = 0; i < ANYWHERE; ++i)
++        pick(0, 0, W, H);
++
++    if (!reader->readRegionInto(src, want, lin->stride, layout, sample)) {
++        free(want);
++        return res;
++    }
++
++    // alpha / padding bits are not part of the picture: the CPU reader sets them, the GPU copy carries them over
++    const uint32_t MASK = CMgpuCpuReader::isPacked(layout) ? 0x3FFFFFFFu : 0x00FFFFFFu;
++    res.ran             = true;
++    res.blocks          = blocks.size();
++    for (size_t b = 0; b < blocks.size(); ++b) {
++        const auto& r = blocks[b];
++        for (int y = r.y1; y < r.y2; ++y) {
++            const size_t ROW = (size_t)y * lin->stride;
++            for (int x = r.x1; x < r.x2; ++x) {
++                uint32_t scan, rend;
++                memcpy(&scan, got + ROW + (size_t)x * 4, 4);
++                memcpy(&rend, want + ROW + (size_t)x * 4, 4);
++                ++res.pixels;
++                if ((scan & MASK) != (rend & MASK)) {
++                    if (!res.bad)
++                        res.first = std::format("first at ({}, {}): scanout 0x{:08x}, rendered 0x{:08x}, {}", x, y, scan, rend,
++                                                b < FIRST_ANYWHERE ? "inside this frame's copy" : "random spot of the frame");
++                    ++res.bad;
++                }
++            }
++        }
++    }
++    free(want);
++    return res;
++}
++
++// report only: nothing changes course because of a mismatch
++static void verifyFrame(SMgpuOutput& o, SP<CMgpuCpuReader> reader, SP<IBuffer> src, SP<CVkLinearBuffer> lin, const CRegion& copied) {
++    const auto T0  = steady::now();
++    const auto RES = mgpuVerifySamples(reader, src, lin, copied, (uint32_t)o.gpuFrames);
++    const auto MS  = std::chrono::duration<double, std::milli>(steady::now() - T0).count();
++    auto&      s   = stats();
++    if (!RES.ran)
++        mgpuGpuCopyTrace("verify: skipped (no reader, no CPU view of the scanout buffer, unknown format, or the read-back failed)");
++    else if (RES.bad) {
++        ++s.verifyBad;
++        mgpuGpuCopyTrace(std::format("VERIFY MISMATCH on frame {}: {} of {} sampled pixels differ, {}", o.gpuFrames, RES.bad, RES.pixels, RES.first));
++    } else if (++s.verifyOk <= 3 || s.verifyOk % 100 == 0)
++        mgpuGpuCopyTrace(
++            std::format("verify ok on frame {} ({} pixels in {} blocks, {:.1f} ms; {} checks ok, {} bad so far)", o.gpuFrames, RES.pixels, RES.blocks, MS, s.verifyOk, s.verifyBad));
++}
++
++bool Aquamarine::CMgpuCopy::enabled() {
++    return gpuEnabled() || cpuEnabled();
++}
++
++// the primary's reader, created with (or after) its renderer
++SP<CMgpuCpuReader> Aquamarine::CMgpuCopy::reader(SP<CDRMBackend> primary) {
++    if (!primary)
++        return nullptr;
++    if (!primary->rendererState.renderer)
++        primary->initMgpu();
++    const auto RENDERER = primary->rendererState.renderer;
++    if (!RENDERER)
++        return nullptr;
++    if (!cpuReader() || !cpuReader()->usesRenderer(RENDERER))
++        cpuReader() = makeShared<CMgpuCpuReader>(RENDERER);
++    return cpuReader();
++}
++
++void Aquamarine::CMgpuCopy::forget(const CDRMOutput* output) {
++    outputs().erase(output);
++}
++
++void Aquamarine::CMgpuCopy::gpuFailed(const CDRMOutput* output, SMgpuOutput& o, const std::string& why) {
++    // try again later: 30 s, 2 min, 8 min, 32 min, then hourly. A retry that fails costs at most one frame.
++    const auto PAUSE = std::chrono::seconds(std::min<uint64_t>(3600, 30ULL << (2 * std::min<uint32_t>(o.gpuFailures, 4))));
++    o.gpuOff         = true;
++    o.gpuRetryAt     = steady::now() + PAUSE;
++    ++o.gpuFailures;
++    ++stats().gpuFailures;
++    o.gpu.journal.reset();
++
++    const auto MSG = std::format("{}{}; failure {} on this output, next try in {} s", why, cpuEnabled() ? "; using AQ_MGPU_CPU_COPY" : "", o.gpuFailures, PAUSE.count());
++    mgpuGpuCopyTrace("FAILED: " + MSG);
++    if (const auto BACKEND = output->backend.lock(); BACKEND)
++        BACKEND->backend->log(AQ_LOG_ERROR, "drm: AQ_MGPU_GPU_COPY: " + MSG);
++}
++
++void Aquamarine::CMgpuCopy::commitResult(const CDRMOutput* output, bool ok, bool onlyTest) {
++    if (!gpuEnabled())
++        return;
++    const auto IT = outputs().find(output);
++    if (IT == outputs().end() || !IT->second.gpuCommitPending)
++        return;
++    IT->second.gpuCommitPending = false;
++    // safety net: if KMS refuses the framebuffer the GPU copy produced (a plane may not take a linear buffer from
++    // another device), the next frame goes through the CPU copy
++    if (!ok)
++        gpuFailed(output, IT->second, std::format("KMS refused the commit{}", onlyTest ? " (test)" : ""));
++}
++
++CMgpuCopy::eResult Aquamarine::CMgpuCopy::copyFrame(CDRMOutput* output, SDRMConnectorCommitData& data, bool onlyTest, SP<CDRMFB>& fb) {
++    if (!enabled() || !output || !data.outputState.buffer)
++        return eResult::NOT_HANDLED;
++
++    auto& o            = outputs()[output];
++    o.gpuCommitPending = false;
++
++    // both engines replace the commit's in-fence: keep what the compositor passed
++    const int IN_FENCE = data.outputState.explicitInFence;
++
++    if (gpuEnabled()) {
++        if (o.gpuOff && steady::now() >= o.gpuRetryAt) {
++            o.gpuOff = false;
++            mgpuGpuCopyTrace(std::format("trying the GPU copy again (after {} failures on this output)", o.gpuFailures));
++        }
++        if (!o.gpuOff) {
++            std::string why;
++            if (gpuCopy(output, o, data, IN_FENCE, onlyTest, fb, why)) {
++                o.gpuCommitPending = true;
++                return eResult::COPIED;
++            }
++            data.outputState.explicitInFence = IN_FENCE;
++            fb.reset();
++            gpuFailed(output, o, why);
++        }
++    }
++
++    if (cpuEnabled())
++        return cpuCopy(output, o, data, IN_FENCE, fb) ? eResult::COPIED : eResult::FAILED;
++
++    return eResult::NOT_HANDLED;
++}
++
++bool Aquamarine::CMgpuCopy::gpuCopy(CDRMOutput* output, SMgpuOutput& o, SDRMConnectorCommitData& data, int inFence, bool onlyTest, SP<CDRMFB>& fb, std::string& why) {
++    const auto     BACKEND   = output->backend.lock();
++    const auto     PRIMARY   = BACKEND ? BACKEND->primary.lock() : nullptr;
++    const auto&    STATE     = data.outputState;
++    const uint32_t COMMITTED = STATE.committed;
++    if (!BACKEND || !PRIMARY) {
++        why = "no primary GPU";
++        return false;
++    }
++
++    if (!vkCopier()) {
++        static bool tried = false;
++        if (!tried) {
++            tried      = true;
++            vkCopier() = CMgpuVkCopy::create(PRIMARY->gpu->fd, BACKEND->backend);
++        }
++    }
++    const auto COPIER = vkCopier();
++    if (!COPIER) {
++        why = "no usable Vulkan device on the primary GPU";
++        return false;
++    }
++
++    // the bytes are copied as they are: scan them out as the opaque variant of the primary's format
++    const auto DMA     = STATE.buffer->dmabuf();
++    uint32_t   scanFmt = DMA.format;
++    switch (DMA.format) {
++        case DRM_FORMAT_ARGB8888: scanFmt = DRM_FORMAT_XRGB8888; break;
++        case DRM_FORMAT_ABGR8888: scanFmt = DRM_FORMAT_XBGR8888; break;
++        case DRM_FORMAT_ARGB2101010: scanFmt = DRM_FORMAT_XRGB2101010; break;
++        case DRM_FORMAT_ABGR2101010: scanFmt = DRM_FORMAT_XBGR2101010; break;
++        default: break;
++    }
++    if (CMgpuVkCopy::vkFormatFor(scanFmt) == VK_FORMAT_UNDEFINED) {
++        why = std::format("unsupported format {}", fourccToName(DMA.format));
++        return false;
++    }
++
++    if (!o.gpu.allocator) {
++        o.gpu.allocator = CVkLinearAllocator::create(COPIER, BACKEND->backend);
++        o.gpu.swapchain = CSwapchain::create(o.gpu.allocator, BACKEND);
++    }
++    const auto SIZE = STATE.buffer->size;
++    const auto BUF  = o.gpu.next(SIZE, scanFmt);
++    if (!BUF) {
++        why = "the linear swapchain has no buffer";
++        return false;
++    }
++    // the atomic commit sizes the plane from IBuffer::size: a mismatch is a black screen, not a failed commit
++    if (BUF->size != SIZE || BUF->dmabuf().size != SIZE) {
++        why = std::format("the linear buffer is {} (dmabuf {}), the frame is {}", BUF->size, BUF->dmabuf().size, SIZE);
++        return false;
++    }
++    const auto LINEAR = reinterpretPointerCast<CVkLinearBuffer>(BUF);
++
++    CRegion full;
++    full.add(0, 0, SIZE.x, SIZE.y);
++    static const bool ALWAYS_FULL = envEnabled("AQ_MGPU_GPU_COPY_FULL"); // debug: ignore damage
++    const bool        HAS_DAMAGE  = (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_DAMAGE) && !STATE.damage.empty();
++    CRegion           damage      = (HAS_DAMAGE && !ALWAYS_FULL) ? STATE.damage.copy() : full.copy();
++    const CRegion     TO_COPY     = o.gpu.journal.outdated(damage, full);
++
++    // what the copy waits for: the commit's render fence, or (without one) everything this process submitted so far
++    // on the primary, the same ordering AQ_MGPU_CPU_COPY relies on
++    const bool EXPLICIT = (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) && inFence >= 0;
++    const bool VERIFY   = verifyEvery() && o.gpuFrames % verifyEvery() == verifyEvery() - 1;
++    // the primary's renderer is only brought up when it is needed, as before
++    const auto READER   = (!EXPLICIT || VERIFY) ? reader(PRIMARY) : nullptr;
++    const int  OWN_WAIT = !EXPLICIT && READER ? READER->createNativeFenceFD() : -1;
++
++    const double CPU0 = threadCpuMs();
++    const int    DONE = COPIER->copy(STATE.buffer, LINEAR, TO_COPY, EXPLICIT ? inFence : OWN_WAIT);
++    const double CPU  = threadCpuMs() - CPU0;
++    const auto   SUBMITTED = steady::now();
++    if (OWN_WAIT >= 0)
++        close(OWN_WAIT);
++    if (DONE < 0) {
++        why = "the copy failed";
++        return false;
++    }
++
++    auto& s = stats();
++    if (o.lastFence >= 0) {
++        if (!waitFence(o.lastFence, 0))
++            ++s.lateFences; // the previous frame's copy is still not done, a whole frame later
++        close(o.lastFence);
++    }
++    o.lastFence = DONE;
++
++    const bool KMS_WAITS = EXPLICIT && output->supportsExplicit && !VERIFY;
++    if (KMS_WAITS)
++        data.outputState.explicitInFence = DONE; // KMS waits for the copy, the CPU never does
++    else {
++        // no in-fence on this commit (or the frame is being verified): wait here, asleep, so the display never
++        // shows a half copy
++        waitFence(DONE, 100);
++        data.outputState.explicitInFence = -1;
++        s.gpuMs += std::chrono::duration<double, std::milli>(steady::now() - SUBMITTED).count();
++        ++s.gpuMsSamples;
++    }
++
++    if (VERIFY)
++        verifyFrame(o, READER, STATE.buffer, LINEAR, TO_COPY);
++
++    fb = CDRMFB::create(BUF, output->backend, nullptr);
++    if (!fb) {
++        why = "the secondary GPU refused the linear buffer as a framebuffer";
++        return false;
++    }
++
++    o.gpu.journal.wrote(std::move(damage));
++    o.cpu.journal.reset(); // the dumb buffers, if any, are stale from now on
++    ++o.gpuFrames;
++    ++s.gpuFrames;
++    s.copyCpuMs += CPU;
++    s.copyCpuMaxMs = std::max(s.copyCpuMaxMs, CPU);
++
++    if (s.gpuFrames <= 3 || s.gpuFrames % 1000 == 0)
++        mgpuGpuCopyTrace(std::format("frame {} copied ({} rects, {} fence{}) | copy() CPU avg {:.3f} ms, max {:.3f} ms | GPU copy ~{:.2f} ms ({} samples) | late fences {} | "
++                                     "GPU failures {} | CPU-copied frames {} | verify ok {}, bad {}",
++                                     s.gpuFrames, TO_COPY.getRects().size(), KMS_WAITS ? "KMS in-" : "CPU-polled", onlyTest ? ", test commit" : "", s.copyCpuMs / s.gpuFrames,
++                                     s.copyCpuMaxMs, s.gpuMsSamples ? s.gpuMs / s.gpuMsSamples : 0.0, s.gpuMsSamples, s.lateFences, s.gpuFailures, s.cpuFrames, s.verifyOk,
++                                     s.verifyBad));
++    static bool announced = false;
++    if (!announced) {
++        announced = true;
++        BACKEND->backend->log(AQ_LOG_DEBUG, std::format("drm: AQ_MGPU_GPU_COPY: active ({} {}x{}, {} fence)", fourccToName(scanFmt), SIZE.x, SIZE.y,
++                                                         KMS_WAITS ? "KMS in-" : "CPU-polled"));
++    }
++    return true;
++}
++
++bool Aquamarine::CMgpuCopy::cpuCopy(CDRMOutput* output, SMgpuOutput& o, SDRMConnectorCommitData& data, int inFence, SP<CDRMFB>& fb) {
++    const auto     BACKEND   = output->backend.lock();
++    const auto     PRIMARY   = BACKEND ? BACKEND->primary.lock() : nullptr;
++    const auto&    STATE     = data.outputState;
++    const uint32_t COMMITTED = STATE.committed;
++    if (!BACKEND)
++        return false;
++
++    const auto READER = reader(PRIMARY);
++    if (!READER) {
++        BACKEND->backend->log(AQ_LOG_ERROR, "drm: AQ_MGPU_CPU_COPY: no renderer on the primary GPU");
++        return false;
++    }
++
++    // the dumb buffer gets the same layout as the primary's buffer, except that 10 bit always goes opaque: planes
++    // often scan out [XA]RGB8888 and X*2101010 but not A*2101010 (Intel gen9 doesn't)
++    const auto              DMA     = STATE.buffer->dmabuf();
++    uint32_t                dumbFmt = DMA.format;
++    CMgpuCpuReader::eLayout layout;
++    if (!CMgpuCpuReader::layoutFor(DMA.format, layout)) {
++        BACKEND->backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MGPU_CPU_COPY: unsupported format {}", fourccToName(DMA.format)));
++        return false;
++    }
++    if (layout == CMgpuCpuReader::eLayout::XBGR2101010)
++        dumbFmt = DRM_FORMAT_XBGR2101010;
++    else if (layout == CMgpuCpuReader::eLayout::XRGB2101010)
++        dumbFmt = DRM_FORMAT_XRGB2101010;
++
++    if (!o.cpu.allocator) {
++        o.cpu.allocator = CDRMDumbAllocator::create(BACKEND->gpu->fd, BACKEND->backend);
++        if (!o.cpu.allocator) {
++            BACKEND->backend->log(AQ_LOG_ERROR, "drm: AQ_MGPU_CPU_COPY: no dumb allocator on the secondary GPU");
++            return false;
++        }
++        o.cpu.swapchain = CSwapchain::create(o.cpu.allocator, BACKEND);
++    }
++
++    const auto SIZE = STATE.buffer->size;
++    const auto BUF  = o.cpu.next(SIZE, dumbFmt);
++    if (!BUF) {
++        BACKEND->backend->log(AQ_LOG_ERROR, "drm: AQ_MGPU_CPU_COPY: the dumb swapchain has no buffer");
++        return false;
++    }
++
++    CRegion full;
++    full.add(0, 0, SIZE.x, SIZE.y);
++    static const bool ALWAYS_FULL = envEnabled("AQ_MGPU_CPU_COPY_FULL"); // debug: ignore damage
++    const bool        HAS_DAMAGE  = (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_DAMAGE) && !STATE.damage.empty();
++    CRegion           damage      = (HAS_DAMAGE && !ALWAYS_FULL) ? STATE.damage.copy() : full.copy();
++    const CRegion     TO_COPY     = o.cpu.journal.outdated(damage, full);
++
++    const auto [PTR, FMT, LEN] = BUF->beginDataPtr(0);
++    const auto STRIDE          = BUF->dmabuf().strides.at(0);
++    const bool COPIED          = PTR &&
++        READER->readRegionInto(STATE.buffer, PTR, STRIDE, layout, TO_COPY, (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? inFence : -1);
++    BUF->endDataPtr();
++    if (!COPIED) {
++        BACKEND->backend->log(AQ_LOG_ERROR, "drm: AQ_MGPU_CPU_COPY: reading the primary's buffer failed");
++        return false;
++    }
++
++    o.cpu.journal.wrote(std::move(damage));
++    ++stats().cpuFrames;
++
++    // the pixels are already in place: there is nothing for KMS to wait on
++    data.outputState.explicitInFence = -1;
++
++    fb = CDRMFB::create(BUF, output->backend, nullptr);
++    return !!fb;
++}
+diff --git a/src/backend/drm/mgpu/MgpuCopy.hpp b/src/backend/drm/mgpu/MgpuCopy.hpp
+new file mode 100644
+index 0000000..89bfc55
+--- /dev/null
++++ b/src/backend/drm/mgpu/MgpuCopy.hpp
+@@ -0,0 +1,71 @@
++#pragma once
++
++// "The primary GPU renders, a secondary GPU only scans out", for pairs where the regular multi-GPU path cannot work
++// (an NVIDIA primary cannot render into LINEAR, and a Mesa secondary cannot read NVIDIA's native layout). The
++// secondary never imports the primary's frame. Instead, each frame, the primary copies the damaged region into a
++// linear buffer the secondary can scan out:
++//
++//   AQ_MGPU_GPU_COPY  the primary's Vulkan copy engine writes into a buffer it exported (VkCopy.hpp): ~0 CPU
++//   AQ_MGPU_CPU_COPY  the primary reads the region back into a dumb buffer of the secondary (CpuCopy.hpp)
++//
++// With both set, the GPU copy is used and the CPU copy is its fallback, per output: a failure switches that output
++// to the CPU copy and the GPU copy is tried again after a growing pause.
++//
++// Debugging: AQ_MGPU_GPU_COPY_LOG=<file> (flushed trace with counters), AQ_MGPU_GPU_COPY_VERIFY=<n> (every n-th
++// frame, compare samples of the scanout buffer against the rendered frame), AQ_MGPU_{GPU,CPU}_COPY_FULL (ignore
++// damage).
++//
++// Everything lives in this directory. Upstream files only carry the hooks: DRM.cpp (prepareAsyncCommitData,
++// commitState x2, ~CDRMOutput, releaseMgpuResources), GBM.cpp (keep the primary's native layout), and one friend
++// declaration each in CDRMOutput, CDRMBackend and CDRMRenderer. State is kept here, not in those classes, so the
++// public headers' layout and the ABI stay as they are.
++
++#include <aquamarine/backend/DRM.hpp>
++#include <cstdint>
++#include <string>
++
++namespace Aquamarine {
++    class CMgpuCpuReader;
++    class CVkLinearBuffer;
++    struct SMgpuOutput;
++
++    struct SMgpuVerifyResult {
++        bool        ran    = false; // false: nothing could be compared (no reader, no CPU view, unknown format)
++        uint64_t    pixels = 0, bad = 0, blocks = 0;
++        std::string first; // where and what the first difference is
++    };
++
++    // AQ_MGPU_GPU_COPY_VERIFY: compares samples of the scanout buffer with the rendered frame, once the copy is
++    // complete: 64x64 blocks, most inside `copied` (what this frame's copy wrote), some anywhere in the frame (a
++    // stale region there means the damage accounting is wrong). Alpha / padding bits are ignored. A whole-frame
++    // compare is not possible: the scanout buffer reads back at ~85 MiB/s.
++    SMgpuVerifyResult mgpuVerifySamples(Hyprutils::Memory::CSharedPointer<CMgpuCpuReader> reader, Hyprutils::Memory::CSharedPointer<IBuffer> rendered,
++                                        Hyprutils::Memory::CSharedPointer<CVkLinearBuffer> scanout, const Hyprutils::Math::CRegion& copied, uint32_t seed);
++
++    class CMgpuCopy {
++      public:
++        enum class eResult : uint8_t {
++            NOT_HANDLED, // not enabled (or only the GPU copy is, and it failed): the caller goes on as upstream does
++            COPIED,      // `fb` holds the frame, data.outputState.explicitInFence is what KMS has to wait for
++            FAILED,      // the commit cannot go on
++        };
++
++        // AQ_MGPU_CPU_COPY or AQ_MGPU_GPU_COPY is set
++        static bool enabled();
++
++        // CDRMOutput::commitState(): the output is on a secondary GPU and data.outputState.buffer is a new frame
++        static eResult copyFrame(CDRMOutput* output, SDRMConnectorCommitData& data, bool onlyTest, Hyprutils::Memory::CSharedPointer<CDRMFB>& fb);
++        // CDRMOutput::commitState(): what KMS said about the commit copyFrame() prepared
++        static void commitResult(const CDRMOutput* output, bool ok, bool onlyTest);
++        // the output is going away or releasing its multi-GPU resources
++        static void forget(const CDRMOutput* output);
++
++      private:
++        static bool                                              gpuCopy(CDRMOutput* output, SMgpuOutput& o, SDRMConnectorCommitData& data, int inFence, bool onlyTest,
++                                                                         Hyprutils::Memory::CSharedPointer<CDRMFB>& fb, std::string& why);
++        static bool                                              cpuCopy(CDRMOutput* output, SMgpuOutput& o, SDRMConnectorCommitData& data, int inFence,
++                                                                         Hyprutils::Memory::CSharedPointer<CDRMFB>& fb);
++        static void                                              gpuFailed(const CDRMOutput* output, SMgpuOutput& o, const std::string& why);
++        static Hyprutils::Memory::CSharedPointer<CMgpuCpuReader> reader(Hyprutils::Memory::CSharedPointer<CDRMBackend> primary);
++    };
++}
+diff --git a/src/backend/drm/mgpu/VkCopy.cpp b/src/backend/drm/mgpu/VkCopy.cpp
+new file mode 100644
+index 0000000..7d1cadc
+--- /dev/null
++++ b/src/backend/drm/mgpu/VkCopy.cpp
+@@ -0,0 +1,590 @@
++#include "VkCopy.hpp"
++#include <aquamarine/backend/Backend.hpp>
++#include <aquamarine/allocator/Swapchain.hpp>
++#include <drm_fourcc.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#include <unistd.h>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <format>
++#include <optional>
++#include <string>
++#include <vector>
++
++using namespace Aquamarine;
++using namespace Hyprutils::Memory;
++using namespace Hyprutils::Math;
++#define SP CSharedPointer
++#define WP CWeakPointer
++
++void Aquamarine::mgpuGpuCopyTrace(const std::string& msg) {
++    static const char* PATH = getenv("AQ_MGPU_GPU_COPY_LOG");
++    if (!PATH || !*PATH)
++        return;
++    if (FILE* f = fopen(PATH, "a")) {
++        timespec t;
++        clock_gettime(CLOCK_MONOTONIC, &t);
++        fprintf(f, "[%ld.%03ld] %s\n", (long)t.tv_sec, t.tv_nsec / 1000000, msg.c_str());
++        fflush(f);
++        fclose(f);
++    }
++}
++
++namespace {
++    // Sets or clears environment variables for its lifetime and restores them after.
++    // The NVIDIA Vulkan driver connects to the X server in $DISPLAY while enumerating devices. Inside the compositor
++    // that X server is the compositor's own (lazy) Xwayland, which cannot answer while the compositor's thread is
++    // blocked in that very call: a deadlock with no picture (seen 2026-11-13). Implicit layers (device selection,
++    // overlays) have no business inside a compositor either.
++    class CEnvGuard {
++      public:
++        void set(const char* name, const char* value) {
++            const char* OLD = getenv(name);
++            saved.push_back({name, OLD ? std::optional<std::string>(OLD) : std::nullopt});
++            if (value)
++                setenv(name, value, 1);
++            else
++                unsetenv(name);
++        }
++        ~CEnvGuard() {
++            for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
++                if (it->second)
++                    setenv(it->first.c_str(), it->second->c_str(), 1);
++                else
++                    unsetenv(it->first.c_str());
++            }
++        }
++
++      private:
++        std::vector<std::pair<std::string, std::optional<std::string>>> saved;
++    };
++}
++
++// ---------------- CVkLinearBuffer ----------------
++
++Aquamarine::CVkLinearBuffer::~CVkLinearBuffer() {
++    if (attrs.fds[0] >= 0)
++        close(attrs.fds[0]);
++    if (auto c = copier.lock(); c && c->device) {
++        // a copy into this buffer may still be in flight when a swapchain is reconfigured: rare, so just wait
++        vkDeviceWaitIdle(c->device);
++        if (buffer)
++            vkDestroyBuffer(c->device, buffer, nullptr);
++        if (memory)
++            vkFreeMemory(c->device, memory, nullptr);
++    }
++}
++
++eBufferCapability Aquamarine::CVkLinearBuffer::caps() {
++    return BUFFER_CAPABILITY_NONE;
++}
++
++eBufferType Aquamarine::CVkLinearBuffer::type() {
++    return BUFFER_TYPE_DMABUF;
++}
++
++void Aquamarine::CVkLinearBuffer::update(const CRegion& damage) {
++    ;
++}
++
++bool Aquamarine::CVkLinearBuffer::isSynchronous() {
++    return false;
++}
++
++bool Aquamarine::CVkLinearBuffer::good() {
++    return attrs.success;
++}
++
++const uint8_t* Aquamarine::CVkLinearBuffer::map() {
++    if (!mapped) {
++        const auto c = copier.lock();
++        if (!c || !c->device || !memory || vkMapMemory(c->device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
++            mapped = nullptr;
++    }
++    return (const uint8_t*)mapped; // unmapped by vkFreeMemory
++}
++
++SDMABUFAttrs Aquamarine::CVkLinearBuffer::dmabuf() {
++    return attrs;
++}
++
++// ---------------- CVkLinearAllocator ----------------
++
++SP<CVkLinearAllocator> Aquamarine::CVkLinearAllocator::create(SP<CMgpuVkCopy> copier, WP<CBackend> backend) {
++    if (!copier)
++        return nullptr;
++    auto a     = SP<CVkLinearAllocator>(new CVkLinearAllocator());
++    a->copier  = copier;
++    a->backend = backend;
++    return a;
++}
++
++SP<IBuffer> Aquamarine::CVkLinearAllocator::acquire(const SAllocatorBufferParams& params, SP<CSwapchain> swapchain) {
++    auto buf = copier->allocate(params.size, params.format);
++    if (!buf || !buf->good())
++        return nullptr;
++    return buf;
++}
++
++SP<CBackend> Aquamarine::CVkLinearAllocator::getBackend() {
++    return backend.lock();
++}
++
++int Aquamarine::CVkLinearAllocator::drmFD() {
++    return -1; // the buffers belong to a Vulkan device, not to a DRM fd
++}
++
++eAllocatorType Aquamarine::CVkLinearAllocator::type() {
++    return AQ_ALLOCATOR_TYPE_DRM_DUMB; // closest existing kind: linear, scanout-only, never rendered into
++}
++
++// ---------------- CVkImportedImageAttachment ----------------
++
++Aquamarine::CVkImportedImageAttachment::~CVkImportedImageAttachment() {
++    auto c = copier.lock();
++    if (!c || !c->device)
++        return;
++    vkDeviceWaitIdle(c->device);
++    if (image)
++        vkDestroyImage(c->device, image, nullptr);
++    if (memory)
++        vkFreeMemory(c->device, memory, nullptr);
++}
++
++// ---------------- CMgpuVkCopy ----------------
++
++void Aquamarine::CMgpuVkCopy::log(int level, const std::string& msg) {
++    mgpuGpuCopyTrace(msg);
++    if (auto b = backend.lock())
++        b->log((eBackendLogLevel)level, "drm: AQ_MGPU_GPU_COPY: " + msg);
++}
++
++VkFormat Aquamarine::CMgpuVkCopy::vkFormatFor(uint32_t drmFormat) {
++    switch (drmFormat) {
++        case DRM_FORMAT_XRGB8888:
++        case DRM_FORMAT_ARGB8888: return VK_FORMAT_B8G8R8A8_UNORM;
++        case DRM_FORMAT_XBGR8888:
++        case DRM_FORMAT_ABGR8888: return VK_FORMAT_R8G8B8A8_UNORM;
++        case DRM_FORMAT_XBGR2101010:
++        case DRM_FORMAT_ABGR2101010: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++        case DRM_FORMAT_XRGB2101010:
++        case DRM_FORMAT_ARGB2101010: return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
++        default: return VK_FORMAT_UNDEFINED;
++    }
++}
++
++SP<CMgpuVkCopy> Aquamarine::CMgpuVkCopy::create(int primaryDrmFD, WP<CBackend> backend) {
++    auto c     = SP<CMgpuVkCopy>(new CMgpuVkCopy());
++    c->self    = c;
++    c->backend = backend;
++    if (!c->init(primaryDrmFD))
++        return nullptr;
++    return c;
++}
++
++static bool hasExtension(const std::vector<VkExtensionProperties>& exts, const char* name) {
++    for (const auto& e : exts)
++        if (!strcmp(e.extensionName, name))
++            return true;
++    return false;
++}
++
++bool Aquamarine::CMgpuVkCopy::init(int primaryDrmFD) {
++    struct stat st;
++    if (fstat(primaryDrmFD, &st) != 0) {
++        log(AQ_LOG_ERROR, "fstat on the primary GPU fd failed");
++        return false;
++    }
++
++    // everything up to the device creation runs without $DISPLAY / $WAYLAND_DISPLAY and without implicit layers
++    CEnvGuard env;
++    env.set("DISPLAY", nullptr);
++    env.set("WAYLAND_DISPLAY", nullptr);
++    env.set("VK_LOADER_LAYERS_DISABLE", "~implicit~");
++    log(AQ_LOG_DEBUG, "creating the Vulkan instance (DISPLAY, WAYLAND_DISPLAY and implicit layers suppressed)");
++
++    VkApplicationInfo    app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "aquamarine", .apiVersion = VK_API_VERSION_1_2};
++    VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
++    if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) {
++        log(AQ_LOG_ERROR, "vkCreateInstance failed");
++        return false;
++    }
++
++    uint32_t n = 0;
++    vkEnumeratePhysicalDevices(instance, &n, nullptr);
++    std::vector<VkPhysicalDevice> devices(n);
++    vkEnumeratePhysicalDevices(instance, &n, devices.data());
++
++    const char*              REQUIRED[] = {"VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf", "VK_EXT_image_drm_format_modifier", "VK_KHR_external_semaphore_fd",
++                                           "VK_EXT_physical_device_drm"};
++    bool                     foreign    = false;
++    std::vector<const char*> enable;
++    for (auto pd : devices) {
++        uint32_t ne = 0;
++        vkEnumerateDeviceExtensionProperties(pd, nullptr, &ne, nullptr);
++        std::vector<VkExtensionProperties> exts(ne);
++        vkEnumerateDeviceExtensionProperties(pd, nullptr, &ne, exts.data());
++        bool all = true;
++        for (auto r : REQUIRED)
++            all = all && hasExtension(exts, r);
++        if (!all)
++            continue;
++
++        VkPhysicalDeviceDrmPropertiesEXT drm   = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT};
++        VkPhysicalDeviceProperties2      props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drm};
++        vkGetPhysicalDeviceProperties2(pd, &props);
++        const bool MATCH = (drm.hasPrimary && makedev(drm.primaryMajor, drm.primaryMinor) == st.st_rdev) || (drm.hasRender && makedev(drm.renderMajor, drm.renderMinor) == st.st_rdev);
++        if (!MATCH)
++            continue;
++
++        physical = pd;
++        foreign  = hasExtension(exts, "VK_EXT_queue_family_foreign");
++        enable.assign(std::begin(REQUIRED), std::end(REQUIRED));
++        if (foreign) {
++            enable.push_back("VK_EXT_queue_family_foreign");
++            otherFamily = VK_QUEUE_FAMILY_FOREIGN_EXT;
++        }
++        log(AQ_LOG_DEBUG, std::format("using Vulkan device {} (driver {}.{})", props.properties.deviceName, props.properties.driverVersion >> 22, (props.properties.driverVersion >> 14) & 0xff));
++        break;
++    }
++    if (!physical) {
++        log(AQ_LOG_ERROR, "no Vulkan device matching the primary GPU with dma-buf export, DRM modifiers and sync_file support");
++        return false;
++    }
++    vkGetPhysicalDeviceMemoryProperties(physical, &memProps);
++
++    // prefer a transfer-only queue: the copy engine, which runs beside the compositor's rendering
++    uint32_t nq = 0;
++    vkGetPhysicalDeviceQueueFamilyProperties(physical, &nq, nullptr);
++    std::vector<VkQueueFamilyProperties> qs(nq);
++    vkGetPhysicalDeviceQueueFamilyProperties(physical, &nq, qs.data());
++    queueFamily = UINT32_MAX;
++    for (uint32_t i = 0; i < nq; i++)
++        if ((qs[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && !(qs[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
++            queueFamily = i;
++            break;
++        }
++    if (queueFamily == UINT32_MAX)
++        for (uint32_t i = 0; i < nq; i++)
++            if (qs[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)) {
++                queueFamily = i;
++                break;
++            }
++
++    float                   prio = 0.5f;
++    VkDeviceQueueCreateInfo dq   = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = queueFamily, .queueCount = 1, .pQueuePriorities = &prio};
++    VkDeviceCreateInfo      dci  = {.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++                                    .queueCreateInfoCount    = 1,
++                                    .pQueueCreateInfos       = &dq,
++                                    .enabledExtensionCount   = (uint32_t)enable.size(),
++                                    .ppEnabledExtensionNames = enable.data()};
++    if (vkCreateDevice(physical, &dci, nullptr, &device) != VK_SUCCESS) {
++        log(AQ_LOG_ERROR, "vkCreateDevice failed");
++        return false;
++    }
++    vkGetDeviceQueue(device, queueFamily, 0, &queue);
++
++    proc.getMemoryFd           = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device, "vkGetMemoryFdKHR");
++    proc.getMemoryFdProperties = (PFN_vkGetMemoryFdPropertiesKHR)vkGetDeviceProcAddr(device, "vkGetMemoryFdPropertiesKHR");
++    proc.importSemaphoreFd     = (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(device, "vkImportSemaphoreFdKHR");
++    proc.getSemaphoreFd        = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(device, "vkGetSemaphoreFdKHR");
++    if (!proc.getMemoryFd || !proc.getMemoryFdProperties || !proc.importSemaphoreFd || !proc.getSemaphoreFd) {
++        log(AQ_LOG_ERROR, "missing external memory / semaphore entry points");
++        return false;
++    }
++
++    VkCommandPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = queueFamily};
++    if (vkCreateCommandPool(device, &pci, nullptr, &pool) != VK_SUCCESS)
++        return false;
++
++    for (auto& s : slots) {
++        VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
++        VkFenceCreateInfo           fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++        VkSemaphoreCreateInfo       sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
++        VkExportSemaphoreCreateInfo esi = {.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO, .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
++        VkSemaphoreCreateInfo       se2 = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &esi};
++        if (vkAllocateCommandBuffers(device, &cai, &s.cmd) != VK_SUCCESS || vkCreateFence(device, &fci, nullptr, &s.fence) != VK_SUCCESS ||
++            vkCreateSemaphore(device, &sci, nullptr, &s.waitSem) != VK_SUCCESS || vkCreateSemaphore(device, &se2, nullptr, &s.doneSem) != VK_SUCCESS) {
++            log(AQ_LOG_ERROR, "creating the command ring failed");
++            return false;
++        }
++    }
++
++    log(AQ_LOG_DEBUG, std::format("ready: queue family {} ({}), foreign queue family {}", queueFamily,
++                                  (qs[queueFamily].queueFlags & VK_QUEUE_GRAPHICS_BIT) ? "graphics" : "transfer only", foreign ? "yes" : "no (using EXTERNAL)"));
++    return true;
++}
++
++Aquamarine::CMgpuVkCopy::~CMgpuVkCopy() {
++    if (device) {
++        vkDeviceWaitIdle(device);
++        for (auto& s : slots) {
++            if (s.fence)
++                vkDestroyFence(device, s.fence, nullptr);
++            if (s.waitSem)
++                vkDestroySemaphore(device, s.waitSem, nullptr);
++            if (s.doneSem)
++                vkDestroySemaphore(device, s.doneSem, nullptr);
++        }
++        if (pool)
++            vkDestroyCommandPool(device, pool, nullptr);
++        vkDestroyDevice(device, nullptr);
++    }
++    if (instance)
++        vkDestroyInstance(instance, nullptr);
++}
++
++uint32_t Aquamarine::CMgpuVkCopy::memoryType(uint32_t bits, VkMemoryPropertyFlags wanted, VkMemoryPropertyFlags avoid) {
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
++        const auto F = memProps.memoryTypes[i].propertyFlags;
++        if ((bits & (1u << i)) && (F & wanted) == wanted && !(F & avoid))
++            return i;
++    }
++    return UINT32_MAX;
++}
++
++SP<CVkLinearBuffer> Aquamarine::CMgpuVkCopy::allocate(const Vector2D& size, uint32_t drmFormat) {
++    const uint32_t W = (uint32_t)size.x, H = (uint32_t)size.y;
++    if (!W || !H || vkFormatFor(drmFormat) == VK_FORMAT_UNDEFINED) {
++        log(AQ_LOG_ERROR, std::format("cannot allocate a {}x{} buffer of format 0x{:x}", W, H, drmFormat));
++        return nullptr;
++    }
++
++    auto buf    = SP<CVkLinearBuffer>(new CVkLinearBuffer());
++    buf->copier = self;
++    buf->stride = ((W * 4) + 255) & ~255u; // scanout engines want generous pitch alignment
++
++    VkExternalMemoryBufferCreateInfo ebi = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
++    VkBufferCreateInfo               bci = {.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++                                            .pNext       = &ebi,
++                                            .size        = (VkDeviceSize)buf->stride * H,
++                                            .usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                                            .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
++    if (vkCreateBuffer(device, &bci, nullptr, &buf->buffer) != VK_SUCCESS) {
++        log(AQ_LOG_ERROR, "vkCreateBuffer failed");
++        return nullptr;
++    }
++
++    VkMemoryRequirements mr;
++    vkGetBufferMemoryRequirements(device, buf->buffer, &mr);
++    // system RAM: the secondary GPU and its display engine must reach it
++    uint32_t mt = memoryType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (mt == UINT32_MAX)
++        mt = memoryType(mr.memoryTypeBits, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (mt == UINT32_MAX) {
++        log(AQ_LOG_ERROR, "no system-RAM memory type can hold an exportable buffer");
++        return nullptr;
++    }
++    VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .buffer = buf->buffer};
++    VkExportMemoryAllocateInfo    exp = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, .pNext = &ded, .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
++    VkMemoryAllocateInfo          mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &exp, .allocationSize = mr.size, .memoryTypeIndex = mt};
++    if (vkAllocateMemory(device, &mai, nullptr, &buf->memory) != VK_SUCCESS || vkBindBufferMemory(device, buf->buffer, buf->memory, 0) != VK_SUCCESS) {
++        log(AQ_LOG_ERROR, "allocating or binding the exportable memory failed");
++        return nullptr;
++    }
++
++    int                   fd  = -1;
++    VkMemoryGetFdInfoKHR  gfi = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = buf->memory, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
++    if (proc.getMemoryFd(device, &gfi, &fd) != VK_SUCCESS || fd < 0) {
++        log(AQ_LOG_ERROR, "exporting the buffer as a dma-buf failed");
++        return nullptr;
++    }
++
++    buf->attrs.success    = true;
++    buf->attrs.size       = size;
++    buf->size             = size; // IBuffer::size: the atomic commit sizes the plane (SRC_W/H, CRTC_W/H) from it; 0x0 = black screen (2026-11-13)
++    buf->attrs.format     = drmFormat;
++    buf->attrs.modifier   = DRM_FORMAT_MOD_LINEAR;
++    buf->attrs.planes     = 1;
++    buf->attrs.offsets[0] = 0;
++    buf->attrs.strides[0] = buf->stride;
++    buf->attrs.fds[0]     = fd;
++    log(AQ_LOG_DEBUG, std::format("allocated a linear {}x{} buffer (pitch {}) in memory type {}, exported as dma-buf", W, H, buf->stride, mt));
++    return buf;
++}
++
++SP<CVkImportedImageAttachment> Aquamarine::CMgpuVkCopy::importImage(SP<IBuffer> from) {
++    const auto DMA = from->dmabuf();
++    if (auto at = from->attachments.get<CVkImportedImageAttachment>(); at && at->modifier == DMA.modifier && at->size == DMA.size)
++        return at;
++
++    if (!DMA.success || DMA.planes != 1 || DMA.modifier == DRM_FORMAT_MOD_INVALID || vkFormatFor(DMA.format) == VK_FORMAT_UNDEFINED) {
++        log(AQ_LOG_ERROR, std::format("cannot import the primary's buffer (planes {}, modifier 0x{:x}, format 0x{:x})", DMA.planes, DMA.modifier, DMA.format));
++        return nullptr;
++    }
++
++    auto at      = makeShared<CVkImportedImageAttachment>();
++    at->copier   = self;
++    at->modifier = DMA.modifier;
++    at->size     = DMA.size;
++
++    VkSubresourceLayout                           layout = {.offset = DMA.offsets[0], .size = 0, .rowPitch = DMA.strides[0]};
++    VkImageDrmFormatModifierExplicitCreateInfoEXT expl   = {.sType                       = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++                                                            .drmFormatModifier           = DMA.modifier,
++                                                            .drmFormatModifierPlaneCount = 1,
++                                                            .pPlaneLayouts               = &layout};
++    VkExternalMemoryImageCreateInfo emi = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, .pNext = &expl, .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
++    VkImageCreateInfo               ici = {.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++                                           .pNext         = &emi,
++                                           .imageType     = VK_IMAGE_TYPE_2D,
++                                           .format        = vkFormatFor(DMA.format),
++                                           .extent        = {(uint32_t)DMA.size.x, (uint32_t)DMA.size.y, 1},
++                                           .mipLevels     = 1,
++                                           .arrayLayers   = 1,
++                                           .samples       = VK_SAMPLE_COUNT_1_BIT,
++                                           .tiling        = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++                                           .usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++                                           .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
++                                           .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
++    if (vkCreateImage(device, &ici, nullptr, &at->image) != VK_SUCCESS) {
++        log(AQ_LOG_ERROR, std::format("vkCreateImage for the primary's buffer failed (modifier 0x{:x})", DMA.modifier));
++        return nullptr;
++    }
++
++    const int fd = dup(DMA.fds[0]);
++    if (fd < 0)
++        return nullptr;
++    VkMemoryFdPropertiesKHR fdp = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
++    if (proc.getMemoryFdProperties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fdp) != VK_SUCCESS) {
++        close(fd);
++        log(AQ_LOG_ERROR, "the primary's dma-buf is not importable");
++        return nullptr;
++    }
++    VkMemoryRequirements imr;
++    vkGetImageMemoryRequirements(device, at->image, &imr);
++    const uint32_t mt = memoryType(imr.memoryTypeBits & fdp.memoryTypeBits, 0);
++    if (mt == UINT32_MAX) {
++        close(fd);
++        log(AQ_LOG_ERROR, "no memory type can import the primary's dma-buf");
++        return nullptr;
++    }
++    VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .image = at->image};
++    VkImportMemoryFdInfoKHR       imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, .pNext = &ded, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = fd};
++    VkMemoryAllocateInfo          mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = imr.size, .memoryTypeIndex = mt};
++    if (vkAllocateMemory(device, &mai, nullptr, &at->memory) != VK_SUCCESS) {
++        close(fd); // ownership moves to Vulkan only on success
++        log(AQ_LOG_ERROR, "importing the primary's dma-buf failed");
++        return nullptr;
++    }
++    if (vkBindImageMemory(device, at->image, at->memory, 0) != VK_SUCCESS) {
++        log(AQ_LOG_ERROR, "binding the imported memory failed");
++        return nullptr;
++    }
++
++    from->attachments.add(at);
++    log(AQ_LOG_DEBUG, std::format("imported a {}x{} primary buffer (modifier 0x{:x})", DMA.size.x, DMA.size.y, DMA.modifier));
++    return at;
++}
++
++int Aquamarine::CMgpuVkCopy::copy(SP<IBuffer> from, SP<CVkLinearBuffer> to, const CRegion& region, int waitFD) {
++    if (!from || !to || !to->good())
++        return -1;
++
++    const auto IMG = importImage(from);
++    if (!IMG)
++        return -1;
++
++    auto& slot = slots[nextSlot];
++    nextSlot   = (nextSlot + 1) % SLOTS;
++    if (slot.submitted) {
++        // never blocks in practice: frames are paced by page flips, a slot comes back SLOTS frames later
++        vkWaitForFences(device, 1, &slot.fence, VK_TRUE, UINT64_MAX);
++        vkResetFences(device, 1, &slot.fence);
++        slot.submitted = false;
++    }
++
++    bool waiting = false;
++    if (waitFD >= 0) {
++        const int fd = dup(waitFD);
++        VkImportSemaphoreFdInfoKHR isf = {.sType      = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
++                                          .semaphore  = slot.waitSem,
++                                          .flags      = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
++                                          .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
++                                          .fd         = fd};
++        if (fd >= 0 && proc.importSemaphoreFd(device, &isf) == VK_SUCCESS)
++            waiting = true;
++        else if (fd >= 0)
++            close(fd);
++    }
++
++    const uint32_t                 OTHER = otherFamily;
++    const VkImageSubresourceRange  RANGE = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++    VkCommandBufferBeginInfo       cbi   = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
++    vkResetCommandBuffer(slot.cmd, 0);
++    vkBeginCommandBuffer(slot.cmd, &cbi);
++
++    // take the frame from its owner (GL) keeping its content: GENERAL, never UNDEFINED
++    VkImageMemoryBarrier acquire = {.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++                                    .srcAccessMask       = 0,
++                                    .dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
++                                    .oldLayout           = VK_IMAGE_LAYOUT_GENERAL,
++                                    .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                    .srcQueueFamilyIndex = OTHER,
++                                    .dstQueueFamilyIndex = queueFamily,
++                                    .image               = IMG->image,
++                                    .subresourceRange    = RANGE};
++    vkCmdPipelineBarrier(slot.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &acquire);
++
++    const auto                     SIZE = from->dmabuf().size;
++    CRegion                        clipped = region.copy();
++    clipped.intersect(0, 0, SIZE.x, SIZE.y);
++    std::vector<VkBufferImageCopy> regions;
++    clipped.forEachRect([&](const pixman_box32_t& r) {
++        const int W = r.x2 - r.x1, H = r.y2 - r.y1;
++        if (W <= 0 || H <= 0)
++            return;
++        regions.push_back({.bufferOffset      = (VkDeviceSize)r.y1 * to->stride + (VkDeviceSize)r.x1 * 4,
++                           .bufferRowLength   = to->stride / 4,
++                           .bufferImageHeight = 0,
++                           .imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++                           .imageOffset       = {r.x1, r.y1, 0},
++                           .imageExtent       = {(uint32_t)W, (uint32_t)H, 1}});
++    });
++    if (!regions.empty())
++        vkCmdCopyImageToBuffer(slot.cmd, IMG->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, to->buffer, (uint32_t)regions.size(), regions.data());
++
++    // give both back: the frame to GL, the linear buffer to the secondary GPU's display engine
++    VkImageMemoryBarrier  release  = acquire;
++    release.srcAccessMask          = VK_ACCESS_TRANSFER_READ_BIT;
++    release.dstAccessMask          = 0;
++    release.oldLayout              = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    release.newLayout              = VK_IMAGE_LAYOUT_GENERAL;
++    release.srcQueueFamilyIndex    = queueFamily;
++    release.dstQueueFamilyIndex    = OTHER;
++    VkBufferMemoryBarrier handOver = {.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
++                                      .srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
++                                      .dstAccessMask       = 0,
++                                      .srcQueueFamilyIndex = queueFamily,
++                                      .dstQueueFamilyIndex = OTHER,
++                                      .buffer              = to->buffer,
++                                      .offset              = 0,
++                                      .size                = VK_WHOLE_SIZE};
++    vkCmdPipelineBarrier(slot.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 1, &handOver, 1, &release);
++    vkEndCommandBuffer(slot.cmd);
++
++    const VkPipelineStageFlags STAGE = VK_PIPELINE_STAGE_TRANSFER_BIT;
++    VkSubmitInfo               si    = {.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++                                        .waitSemaphoreCount   = waiting ? 1u : 0u,
++                                        .pWaitSemaphores      = &slot.waitSem,
++                                        .pWaitDstStageMask    = &STAGE,
++                                        .commandBufferCount   = 1,
++                                        .pCommandBuffers      = &slot.cmd,
++                                        .signalSemaphoreCount = 1,
++                                        .pSignalSemaphores    = &slot.doneSem};
++    if (vkQueueSubmit(queue, 1, &si, slot.fence) != VK_SUCCESS) {
++        log(AQ_LOG_ERROR, "vkQueueSubmit failed");
++        return -1;
++    }
++    slot.submitted = true;
++
++    int                     out = -1;
++    VkSemaphoreGetFdInfoKHR sgf = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, .semaphore = slot.doneSem, .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
++    if (proc.getSemaphoreFd(device, &sgf, &out) != VK_SUCCESS || out < 0) {
++        log(AQ_LOG_ERROR, "exporting the copy's sync_file failed");
++        return -1;
++    }
++    return out;
++}
+diff --git a/src/backend/drm/mgpu/VkCopy.hpp b/src/backend/drm/mgpu/VkCopy.hpp
+new file mode 100644
+index 0000000..73ab578
+--- /dev/null
++++ b/src/backend/drm/mgpu/VkCopy.hpp
+@@ -0,0 +1,146 @@
++#pragma once
++
++// AQ_MGPU_GPU_COPY: frames rendered by the primary GPU reach an output on a secondary GPU without the CPU touching
++// pixels. The primary's Vulkan driver allocates LINEAR buffers in system RAM and exports them as dma-bufs; the
++// secondary imports them as KMS framebuffers and scans them out. Each frame, the primary's copy engine copies the
++// damaged rectangles of its native (e.g. NVIDIA block-linear) frame into one of them, waiting on the frame's render
++// fence on the GPU, and hands back a sync_file that KMS waits on.
++//
++// Written for an NVIDIA primary (which cannot render into LINEAR, so the regular multi-GPU path cannot work, see
++// AQ_MGPU_CPU_COPY) and an Intel secondary; nothing in it is NVIDIA-specific.
++
++#include <aquamarine/allocator/Allocator.hpp>
++#include <aquamarine/buffer/Buffer.hpp>
++#include <aquamarine/misc/Attachment.hpp>
++#include <hyprutils/math/Region.hpp>
++#include <hyprutils/math/Vector2D.hpp>
++#include <hyprutils/memory/SharedPtr.hpp>
++#include <hyprutils/memory/WeakPtr.hpp>
++#include <vulkan/vulkan.h>
++#include <array>
++#include <cstdint>
++
++namespace Aquamarine {
++    class CBackend;
++    class CMgpuVkCopy;
++
++    // AQ_MGPU_GPU_COPY_LOG=<file>: append one line per event to that file, flushed immediately, so a session that has
++    // to be killed (no picture) still leaves evidence; the compositor's own log is buffered and loses its tail.
++    void mgpuGpuCopyTrace(const std::string& msg);
++
++    // A LINEAR buffer in system RAM, owned by the primary's Vulkan device, exported as a dma-buf.
++    class CVkLinearBuffer : public IBuffer {
++      public:
++        virtual ~CVkLinearBuffer();
++        virtual eBufferCapability caps();
++        virtual eBufferType       type();
++        virtual void              update(const Hyprutils::Math::CRegion& damage);
++        virtual bool              isSynchronous();
++        virtual bool              good();
++        virtual SDMABUFAttrs      dmabuf();
++
++        VkBuffer                  buffer = VK_NULL_HANDLE;
++        VkDeviceMemory            memory = VK_NULL_HANDLE;
++        uint32_t                  stride = 0;
++
++        // CPU view of the pixels, for AQ_MGPU_GPU_COPY_VERIFY only. The memory is not CPU-cached (measured: ~85 MiB/s,
++        // half a second for a 5120x2160 frame), so read small samples, never whole frames. nullptr on failure.
++        const uint8_t*            map();
++
++      private:
++        CVkLinearBuffer() = default;
++
++        Hyprutils::Memory::CWeakPointer<CMgpuVkCopy> copier;
++        SDMABUFAttrs                                 attrs{.success = false};
++        void*                                        mapped = nullptr;
++
++        friend class CMgpuVkCopy;
++    };
++
++    // Feeds a CSwapchain with CVkLinearBuffers.
++    class CVkLinearAllocator : public IAllocator {
++      public:
++        static Hyprutils::Memory::CSharedPointer<CVkLinearAllocator> create(Hyprutils::Memory::CSharedPointer<CMgpuVkCopy> copier,
++                                                                            Hyprutils::Memory::CWeakPointer<CBackend>    backend);
++        virtual Hyprutils::Memory::CSharedPointer<IBuffer>  acquire(const SAllocatorBufferParams& params, Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain);
++        virtual Hyprutils::Memory::CSharedPointer<CBackend> getBackend();
++        virtual int                                         drmFD();
++        virtual eAllocatorType                              type();
++
++      private:
++        Hyprutils::Memory::CSharedPointer<CMgpuVkCopy> copier;
++        Hyprutils::Memory::CWeakPointer<CBackend>      backend;
++    };
++
++    // The primary's frame imported into Vulkan, cached on the frame's buffer; destroyed with it.
++    class CVkImportedImageAttachment : public IAttachment {
++      public:
++        virtual ~CVkImportedImageAttachment();
++
++        VkImage                                      image  = VK_NULL_HANDLE;
++        VkDeviceMemory                               memory = VK_NULL_HANDLE;
++        uint64_t                                     modifier = 0;
++        Hyprutils::Math::Vector2D                    size;
++        bool                                         acquired = false; // first use needs the initial layout transition
++        Hyprutils::Memory::CWeakPointer<CMgpuVkCopy> copier;
++    };
++
++    class CMgpuVkCopy {
++      public:
++        // primaryDrmFD: any fd of the primary GPU (card or render node); the Vulkan device is matched by DRM node
++        static Hyprutils::Memory::CSharedPointer<CMgpuVkCopy> create(int primaryDrmFD, Hyprutils::Memory::CWeakPointer<CBackend> backend);
++        ~CMgpuVkCopy();
++
++        Hyprutils::Memory::CSharedPointer<CVkLinearBuffer> allocate(const Hyprutils::Math::Vector2D& size, uint32_t drmFormat);
++
++        // Copies `region` (buffer pixels, row 0 first) of `from` into `to`. waitFD: sync_file the copy waits for on the
++        // GPU (dup'ed here, the caller keeps its own), or -1. Returns a sync_file signalled when the copy is complete,
++        // owned by the caller, or -1 on failure.
++        int copy(Hyprutils::Memory::CSharedPointer<IBuffer> from, Hyprutils::Memory::CSharedPointer<CVkLinearBuffer> to, const Hyprutils::Math::CRegion& region,
++                 int waitFD);
++
++        // VkFormat a DRM fourcc is copied as (the copy is raw: any 4-byte format of the same layout works)
++        static VkFormat vkFormatFor(uint32_t drmFormat);
++
++        VkDevice                                     device = VK_NULL_HANDLE;
++        Hyprutils::Memory::CWeakPointer<CMgpuVkCopy> self;
++
++      private:
++        CMgpuVkCopy() = default;
++        bool                                                         init(int primaryDrmFD);
++        uint32_t                                                     memoryType(uint32_t bits, VkMemoryPropertyFlags wanted, VkMemoryPropertyFlags avoid = 0);
++        Hyprutils::Memory::CSharedPointer<CVkImportedImageAttachment> importImage(Hyprutils::Memory::CSharedPointer<IBuffer> from);
++        void                                                         log(int level, const std::string& msg);
++
++        Hyprutils::Memory::CWeakPointer<CBackend> backend;
++        VkInstance                                instance = VK_NULL_HANDLE;
++        VkPhysicalDevice                          physical = VK_NULL_HANDLE;
++        VkPhysicalDeviceMemoryProperties          memProps{};
++        VkQueue                                   queue       = VK_NULL_HANDLE;
++        uint32_t                                  queueFamily = 0;
++        uint32_t                                  otherFamily = VK_QUEUE_FAMILY_EXTERNAL; // FOREIGN_EXT when available: the other side is another device
++        VkCommandPool                             pool        = VK_NULL_HANDLE;
++
++        // a small ring: a slot is reused only after its fence signalled (frames are paced by page flips, so this never waits)
++        static constexpr size_t SLOTS = 4;
++        struct SSlot {
++            VkCommandBuffer cmd       = VK_NULL_HANDLE;
++            VkFence         fence     = VK_NULL_HANDLE;
++            VkSemaphore     waitSem   = VK_NULL_HANDLE; // imported from the render fence (temporary import)
++            VkSemaphore     doneSem   = VK_NULL_HANDLE; // exported as a sync_file
++            bool            submitted = false;
++        };
++        std::array<SSlot, SLOTS> slots;
++        size_t                   nextSlot = 0;
++
++        struct {
++            PFN_vkGetMemoryFdKHR           getMemoryFd           = nullptr;
++            PFN_vkGetMemoryFdPropertiesKHR getMemoryFdProperties = nullptr;
++            PFN_vkImportSemaphoreFdKHR     importSemaphoreFd     = nullptr;
++            PFN_vkGetSemaphoreFdKHR        getSemaphoreFd        = nullptr;
++        } proc;
++
++        friend class CVkLinearBuffer;
++        friend class CVkImportedImageAttachment;
++    };
++};

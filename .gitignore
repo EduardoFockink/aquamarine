@@ -1,6 +1,8 @@
 # makepkg
 /src/
 /pkg/
+/main/src/
+/main/pkg/
 *.pkg.tar.*
 *.tar.gz
 *.log
@@ -10,4 +12,8 @@
 !/tests/*.c
 !/tests/*.cpp
 !/tests/*.inc
+!/tests/*.py
 !/tests/README.md
+
+# local backups of scripts
+*.antes-*
