@@ -159,6 +159,15 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
         explicitModifiers = {DRM_FORMAT_MOD_LINEAR};
     }
 
+    // AQ_MGPU_CPU_COPY / AQ_MGPU_GPU_COPY (src/backend/drm/mgpu): the secondary GPU never imports this buffer, the
+    // primary copies it itself, so don't restrict it to layouts the secondary understands (often just LINEAR, which
+    // Nvidia can't render into).
+    static const bool MGPU_COPY = envEnabled("AQ_MGPU_CPU_COPY") || envEnabled("AQ_MGPU_GPU_COPY");
+    if (MULTIGPU && MGPU_COPY) {
+        allocator->backend->log(AQ_LOG_DEBUG, "GBM: Buffer is marked as multigpu, mgpu copy: using the primary's native layout");
+        explicitModifiers.clear();
+    }
+
     uint32_t flags = GBM_BO_USE_RENDERING;
     if (params.scanout && !MULTIGPU)
         flags |= GBM_BO_USE_SCANOUT;
@@ -168,6 +177,9 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
     if (explicitModifiers.empty()) {
         allocator->backend->log(AQ_LOG_WARNING, "GBM: Using modifier-less allocation");
         bo = gbm_bo_create(allocator->gbmDevice, attrs.size.x, attrs.size.y, attrs.format, flags);
+        // the primary reads this buffer back through EGL (or imports it into Vulkan), which needs its real layout
+        if (bo && MULTIGPU && MGPU_COPY)
+            modifier = gbm_bo_get_modifier(bo);
     } else {
         TRACE(allocator->backend->log(AQ_LOG_TRACE, std::format("GBM: Using modifier-based allocation, modifiers: {}", explicitModifiers.size())));
         for (auto const& mod : explicitModifiers) {

@@ -288,6 +288,7 @@ namespace Aquamarine {
         friend struct SDRMConnector;
         friend class CDRMLease;
         friend class CDRMBackend;
+        friend class CMgpuCopy;
     };
 
     struct SDRMConnectorCommitData {
@@ -579,5 +580,6 @@ namespace Aquamarine {
         friend class CDRMAtomicRequest;
         friend class CDRMLease;
         friend class CGBMBuffer;
+        friend class CMgpuCopy;
     };
 };

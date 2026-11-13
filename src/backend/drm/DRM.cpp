@@ -40,6 +40,7 @@ extern "C" {
 #include "Renderer.hpp"
 #include "OutputTiming.hpp"
 #include "AsyncCommit.hpp"
+#include "mgpu/MgpuCopy.hpp"
 
 #include <hyprutils/utils/ScopeGuard.hpp>
 using Hyprutils::Utils::CScopeGuard;
@@ -2340,11 +2341,13 @@ Aquamarine::CDRMOutput::~CDRMOutput() {
         backend->backend->removeIdleEvent(frameIdle);
     connector->sched.onFrameComplete();
     connector->sched.setFrameScheduled(false);
+    CMgpuCopy::forget(this);
 }
 
 void Aquamarine::CDRMOutput::releaseMgpuResources() {
     mgpu.swapchain.reset();
     mgpu.cursorSwapchain.reset();
+    CMgpuCopy::forget(this);
 
     if (swapchain) {
         auto options   = swapchain->currentOptions();
@@ -2397,6 +2400,12 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
 
     SP<CDRMFB> drmFB;
     if (backend->shouldBlit()) {
+        // the mgpu copy only runs in commitState(): send these commits down the synchronous path
+        if (CMgpuCopy::enabled()) {
+            requiresSync = true;
+            return false;
+        }
+
         if (!backend->rendererState.renderer) {
             backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for asynchronous blitting, initializing");
             if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
@@ -2676,8 +2685,17 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
 
         SP<CDRMFB> drmFB;
 
+        // AQ_MGPU_GPU_COPY / AQ_MGPU_CPU_COPY (mgpu/MgpuCopy.hpp): the primary copies the frame into a linear buffer
+        auto mgpuCopied = CMgpuCopy::eResult::NOT_HANDLED;
+        if (!blittedFB && backend->shouldBlit())
+            mgpuCopied = CMgpuCopy::copyFrame(this, data, onlyTest, drmFB);
+        if (mgpuCopied == CMgpuCopy::eResult::FAILED)
+            return false;
+
         if (blittedFB)
             drmFB = blittedFB;
+        else if (mgpuCopied == CMgpuCopy::eResult::COPIED)
+            ; // drmFB and the in-fence are set
         else if (backend->shouldBlit()) {
             if (!backend->rendererState.renderer) {
                 backend->backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for blitting, initializing");
@@ -2834,6 +2852,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
         data.ctm = STATE.ctm;
 
     bool ok = connector->commitState(data);
+    CMgpuCopy::commitResult(this, ok, onlyTest);
 
     // a buffer acquired only to validate/attempt the modeset isn't consumed by the
     // consumer: rewind the swapchain so the acquire cursor stays in sync with it.

@@ -190,5 +190,6 @@ namespace Aquamarine {
         friend class CEglContextGuard;
         friend class CDRMRendererBufferInputAttachment;
         friend class CDRMRendererBufferOutputAttachment;
+        friend class CMgpuCpuReader;
     };
 };
