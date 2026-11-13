@@ -125,6 +125,9 @@ namespace Aquamarine {
         // Used by AQ_MGPU_CPU_COPY so the secondary GPU never reads (or renders from) the primary's buffers.
         bool readRegionInto(Hyprutils::Memory::CSharedPointer<IBuffer> from, uint8_t* dst, uint32_t dstStride, eCpuCopyLayout layout, const Hyprutils::Math::CRegion& region,
                             int waitFD = -1);
+        // A sync_file signalled when the work submitted so far in this renderer's context is done, or -1.
+        // Used by AQ_MGPU_GPU_COPY when a commit carries no explicit in-fence (same ordering as readRegionInto).
+        int createNativeFenceFD();
         // can't be a SP<> because we call it from buf's ctor...
         void clearBuffer(IBuffer* buf);
 

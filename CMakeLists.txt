@@ -36,7 +36,8 @@ pkg_check_modules(
   gbm
   libudev
   libdisplay-info
-  hwdata)
+  hwdata
+  vulkan)
 
 configure_file(aquamarine.pc.in aquamarine.pc @ONLY)
 

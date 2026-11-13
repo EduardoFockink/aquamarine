@@ -943,6 +943,17 @@ GLuint CDRMRenderer::packFramebuffer(SP<IBuffer> from, const CRegion& region, bo
     return pack.fbo;
 }
 
+int CDRMRenderer::createNativeFenceFD() {
+    CEglContextGuard eglContext(*this);
+    EGLSyncKHR       sync = proc.eglCreateSyncKHR(egl.display, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
+    if (sync == EGL_NO_SYNC_KHR)
+        return -1;
+    glFlush(); // otherwise the fd may not be valid yet
+    const int fd = proc.eglDupNativeFenceFDANDROID(egl.display, sync);
+    proc.eglDestroySyncKHR(egl.display, sync);
+    return fd == EGL_NO_NATIVE_FENCE_FD_ANDROID ? -1 : fd;
+}
+
 void CDRMRenderer::waitForGpuAsleep() {
     EGLSyncKHR sync = proc.eglCreateSyncKHR(egl.display, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
     if (sync == EGL_NO_SYNC_KHR) {

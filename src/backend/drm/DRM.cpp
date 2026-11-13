@@ -53,6 +53,43 @@ using namespace Hyprutils::Math;
 // buffer (that needs both drivers to agree on a memory layout, and an NVIDIA primary + Intel secondary aborts in
 // Mesa). Instead the primary reads only the damaged region straight into a linear, CPU-mapped dumb buffer of the
 // secondary, which just scans it out. State lives here, not in CDRMOutput, so the public header and ABI stay as is.
+#include "VkCopy.hpp"
+#include <poll.h>
+
+// AQ_MGPU_GPU_COPY: like AQ_MGPU_CPU_COPY, the secondary never imports the primary's native buffer, but no CPU
+// copy either: the primary's Vulkan copy engine writes the damaged region into a linear buffer it exported, which
+// the secondary scans out (see VkCopy.hpp). Falls back to AQ_MGPU_CPU_COPY (if enabled) when anything fails.
+namespace {
+    struct SMgpuGpuCopy {
+        Hyprutils::Memory::CSharedPointer<Aquamarine::CVkLinearAllocator> allocator;
+        Hyprutils::Memory::CSharedPointer<Aquamarine::CSwapchain>         swapchain;
+        std::deque<Hyprutils::Math::CRegion>                             damage; // newest first
+        size_t                                                           framesWritten = 0;
+        int                                                              lastFence     = -1; // handed to KMS last frame; closed on the next one
+        bool                                                             failed        = false;
+    };
+    std::unordered_map<const Aquamarine::CDRMOutput*, SMgpuGpuCopy>& mgpuGpuCopies() {
+        static auto* copies = new std::unordered_map<const Aquamarine::CDRMOutput*, SMgpuGpuCopy>(); // never destroyed, see SMgpuCpuCopy
+        return *copies;
+    }
+    Hyprutils::Memory::CSharedPointer<Aquamarine::CMgpuVkCopy>& mgpuVkCopier() {
+        static auto* copier = new Hyprutils::Memory::CSharedPointer<Aquamarine::CMgpuVkCopy>();
+        return *copier;
+    }
+    bool mgpuGpuCopyEnabled() {
+        static const bool ENABLED = Aquamarine::envEnabled("AQ_MGPU_GPU_COPY");
+        return ENABLED;
+    }
+    void forgetMgpuGpuCopy(const Aquamarine::CDRMOutput* out) {
+        auto it = mgpuGpuCopies().find(out);
+        if (it == mgpuGpuCopies().end())
+            return;
+        if (it->second.lastFence >= 0)
+            close(it->second.lastFence);
+        mgpuGpuCopies().erase(it);
+    }
+}
+
 namespace {
     struct SMgpuCpuCopy {
         SP<CDRMDumbAllocator> allocator;
@@ -2364,12 +2401,14 @@ Aquamarine::CDRMOutput::~CDRMOutput() {
     connector->sched.onFrameComplete();
     connector->sched.setFrameScheduled(false);
     mgpuCpuCopies().erase(this);
+    forgetMgpuGpuCopy(this);
 }
 
 void Aquamarine::CDRMOutput::releaseMgpuResources() {
     mgpu.swapchain.reset();
     mgpu.cursorSwapchain.reset();
     mgpuCpuCopies().erase(this);
+    forgetMgpuGpuCopy(this);
 
     if (swapchain) {
         auto options   = swapchain->currentOptions();
@@ -2425,7 +2464,7 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
     SP<CDRMFB> drmFB;
     if (backend->shouldBlit()) {
         // the CPU copy only runs in commitState(): send these commits down the synchronous path
-        if (mgpuCpuCopyEnabled()) {
+        if (mgpuCpuCopyEnabled() || mgpuGpuCopyEnabled()) {
             requiresSync = true;
             return false;
         }
@@ -2704,13 +2743,143 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
         return buf;
     };
 
+    bool usedGpuCopy = false; // AQ_MGPU_GPU_COPY produced this commit's framebuffer
     if (STATE.buffer && STATE.enabled) {
         TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Committed a buffer, updating state"));
 
         SP<CDRMFB> drmFB;
 
+        bool gpuCopied = false;
+        if (!blittedFB && backend->shouldBlit() && mgpuGpuCopyEnabled() && !mgpuGpuCopies()[this].failed) {
+            auto&      g       = mgpuGpuCopies()[this];
+            const auto PRIMARY = backend->primary.lock();
+            auto       fail    = [&](const std::string& why) {
+                mgpuGpuCopyTrace("FAILED: " + why);
+                backend->backend->log(AQ_LOG_ERROR, "drm: AQ_MGPU_GPU_COPY: " + why + (mgpuCpuCopyEnabled() ? "; falling back to AQ_MGPU_CPU_COPY" : ""));
+                g.failed = true;
+            };
+
+            if (!mgpuVkCopier() && PRIMARY) {
+                static bool tried = false;
+                if (!tried) {
+                    tried          = true;
+                    mgpuVkCopier() = CMgpuVkCopy::create(PRIMARY->gpu->fd, backend->backend);
+                }
+            }
+            const auto COPIER = mgpuVkCopier();
+
+            // the bytes are copied as they are: scan them out as the opaque variant of the primary's format
+            const auto DMA     = STATE.buffer->dmabuf();
+            uint32_t   scanFmt = DMA.format;
+            switch (DMA.format) {
+                case DRM_FORMAT_ARGB8888: scanFmt = DRM_FORMAT_XRGB8888; break;
+                case DRM_FORMAT_ABGR8888: scanFmt = DRM_FORMAT_XBGR8888; break;
+                case DRM_FORMAT_ARGB2101010: scanFmt = DRM_FORMAT_XRGB2101010; break;
+                case DRM_FORMAT_ABGR2101010: scanFmt = DRM_FORMAT_XBGR2101010; break;
+                default: break;
+            }
+
+            if (!COPIER)
+                fail("no usable Vulkan device on the primary GPU");
+            else if (CMgpuVkCopy::vkFormatFor(scanFmt) == VK_FORMAT_UNDEFINED)
+                fail(std::format("unsupported format {}", fourccToName(DMA.format)));
+            else {
+                if (!g.allocator) {
+                    g.allocator = CVkLinearAllocator::create(COPIER, backend->backend);
+                    g.swapchain = CSwapchain::create(g.allocator, backend.lock());
+                }
+                auto OPTIONS   = g.swapchain->currentOptions();
+                OPTIONS.size   = STATE.buffer->size;
+                OPTIONS.format = scanFmt;
+                OPTIONS.length = 2;
+                OPTIONS.cursor = false;
+                bool ready     = true;
+                if (const auto& CUR = g.swapchain->currentOptions(); CUR.size != OPTIONS.size || CUR.format != OPTIONS.format || CUR.length != OPTIONS.length) {
+                    ready = g.swapchain->reconfigure(OPTIONS);
+                    g.damage.clear();
+                    g.framesWritten = 0;
+                }
+                const auto BUF = ready ? g.swapchain->next(nullptr) : nullptr;
+                if (!BUF)
+                    fail("the linear swapchain has no buffer");
+                else if (BUF->size != STATE.buffer->size || BUF->dmabuf().size != STATE.buffer->size)
+                    fail(std::format("the linear buffer is {} (dmabuf {}), the frame is {}", BUF->size, BUF->dmabuf().size, STATE.buffer->size));
+                else {
+                    CRegion full;
+                    full.add(0, 0, OPTIONS.size.x, OPTIONS.size.y);
+                    static const bool ALWAYS_FULL = envEnabled("AQ_MGPU_GPU_COPY_FULL"); // debug: ignore damage
+                    const bool        HAS_DAMAGE  = (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_DAMAGE) && !STATE.damage.empty();
+                    CRegion           damage      = (HAS_DAMAGE && !ALWAYS_FULL) ? STATE.damage.copy() : full.copy();
+                    // as in AQ_MGPU_CPU_COPY: this buffer was last written OPTIONS.length frames ago
+                    CRegion toCopy = damage.copy();
+                    if (g.framesWritten < (size_t)OPTIONS.length)
+                        toCopy = full.copy();
+                    else
+                        for (size_t i = 0; i + 1 < (size_t)OPTIONS.length && i < g.damage.size(); ++i)
+                            toCopy.add(g.damage[i]);
+
+                    // what the copy waits for: the commit's render fence, or (without one) everything this
+                    // process submitted so far on the primary, the same ordering AQ_MGPU_CPU_COPY relies on
+                    const bool EXPLICIT = (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) && STATE.explicitInFence >= 0;
+                    int        ownWait  = -1;
+                    if (!EXPLICIT && PRIMARY) {
+                        if (!PRIMARY->rendererState.renderer)
+                            PRIMARY->initMgpu();
+                        if (PRIMARY->rendererState.renderer)
+                            ownWait = PRIMARY->rendererState.renderer->createNativeFenceFD();
+                    }
+                    const int DONE = COPIER->copy(STATE.buffer, reinterpretPointerCast<CVkLinearBuffer>(BUF), toCopy, EXPLICIT ? STATE.explicitInFence : ownWait);
+                    if (ownWait >= 0)
+                        close(ownWait);
+
+                    if (DONE < 0)
+                        fail("the copy failed");
+                    else {
+                        if (g.lastFence >= 0)
+                            close(g.lastFence);
+                        g.lastFence = DONE;
+                        if (EXPLICIT && supportsExplicit)
+                            data.outputState.explicitInFence = DONE; // KMS waits for the copy, the CPU never does
+                        else {
+                            // no in-fence on this commit: wait here, sleeping, so the display never shows a half copy
+                            pollfd pfd = {.fd = DONE, .events = POLLIN, .revents = 0};
+                            while (poll(&pfd, 1, 100) < 0 && errno == EINTR) {
+                                ;
+                            }
+                            data.outputState.explicitInFence = -1;
+                        }
+
+                        drmFB = CDRMFB::create(BUF, backend, nullptr);
+                        if (!drmFB)
+                            fail("the secondary GPU refused the linear buffer as a framebuffer");
+                        else {
+                            g.damage.push_front(std::move(damage));
+                            while (g.damage.size() > (size_t)OPTIONS.length)
+                                g.damage.pop_back();
+                            ++g.framesWritten;
+                            gpuCopied   = true;
+                            usedGpuCopy = true;
+                            static size_t frames = 0;
+                            if (++frames <= 3 || frames % 1000 == 0)
+                                mgpuGpuCopyTrace(std::format("frame {} copied ({} rects, {} fence{})", frames, toCopy.getRects().size(),
+                                                             EXPLICIT && supportsExplicit ? "KMS in-" : "CPU-polled", onlyTest ? ", test commit" : ""));
+                            static bool announced = false;
+                            if (!announced) {
+                                announced = true;
+                                backend->backend->log(AQ_LOG_DEBUG,
+                                                      std::format("drm: AQ_MGPU_GPU_COPY: active ({} {}x{}, {} fence)", fourccToName(scanFmt), OPTIONS.size.x, OPTIONS.size.y,
+                                                                  EXPLICIT && supportsExplicit ? "KMS in-" : "CPU-polled"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if (blittedFB)
             drmFB = blittedFB;
+        else if (gpuCopied)
+            ; // drmFB set above
         else if (backend->shouldBlit() && mgpuCpuCopyEnabled()) {
             // see SMgpuCpuCopy: the primary GPU reads the damaged region into a linear dumb buffer of this GPU
             const auto PRIMARY = backend->primary.lock();
@@ -2969,6 +3138,14 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
         data.ctm = STATE.ctm;
 
     bool ok = connector->commitState(data);
+
+    // safety net: if KMS refuses the framebuffer the GPU copy produced (a plane may not take a linear buffer from
+    // another device), switch this output to AQ_MGPU_CPU_COPY so the next frame goes the proven way
+    if (!ok && usedGpuCopy) {
+        mgpuGpuCopyTrace(std::format("KMS refused the commit{}; disabling for this output", onlyTest ? " (test)" : ""));
+        backend->backend->log(AQ_LOG_ERROR, std::format("drm: AQ_MGPU_GPU_COPY: KMS refused the commit{}; disabling it for this output", onlyTest ? " (test)" : ""));
+        mgpuGpuCopies()[this].failed = true;
+    }
 
     // a buffer acquired only to validate/attempt the modeset isn't consumed by the
     // consumer: rewind the swapchain so the acquire cursor stays in sync with it.
